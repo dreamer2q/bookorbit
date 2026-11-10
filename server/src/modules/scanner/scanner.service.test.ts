@@ -3565,6 +3565,33 @@ describe('targeted book scan', () => {
     expect(mockBuildSingleCandidate).toHaveBeenCalledWith('/library/Author/AudioBook', '/library', expect.any(Array), expect.any(Function));
   });
 
+  it('keeps root ebook files with sidecars in the directory candidate instead of creating duplicate books', async () => {
+    const folder = '/library/Author/Book';
+    const epub = makeFileStat({ format: 'epub', role: 'content' });
+    const fb2 = makeFileStat({ absolutePath: folder + '/book.fb2', format: 'fb2', role: 'content', ino: 1002n });
+    const opf = makeFileStat({ absolutePath: folder + '/book.opf', format: 'opf', role: 'metadata', ino: 1003n });
+    const cover = makeFileStat({ absolutePath: folder + '/book.jpg', format: 'jpg', role: 'cover', ino: 1004n });
+    mockBuildSingleCandidate.mockResolvedValue(makeCandidate(folder, [epub, fb2, opf, cover]));
+    mockFindCandidates.mockResolvedValue({
+      candidates: [makeCandidate(epub.absolutePath, [epub, opf, cover]), makeCandidate(fb2.absolutePath, [fb2])],
+      skippedDirs: new Set(),
+      unchangedDirs: new Set(),
+      dirMtimes: new Map(),
+    });
+    const repo = makeRepo({
+      findLibraryFolders: vi.fn().mockResolvedValue([{ id: 1, path: '/library', libraryId: 1 }]),
+    });
+    const { service } = makeService(repo);
+
+    await (service as any).scanBookDirectory(folder, 1);
+
+    expect(repo.createBook).toHaveBeenCalledTimes(1);
+    expect(repo.createBook).toHaveBeenCalledWith(expect.objectContaining({ folderPath: folder, libraryId: 1 }));
+    for (const file of [epub, fb2, opf, cover]) {
+      expect(repo.createBookFile.mock.calls.filter(([row]) => row.absolutePath === file.absolutePath)).toHaveLength(1);
+    }
+  });
+
   it('recursively scans a created grouping directory for child book folders', async () => {
     const fileStat = makeFileStat({
       absolutePath: '/library/AJ Carter/Book/book.epub',

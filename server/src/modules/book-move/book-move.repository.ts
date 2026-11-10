@@ -1,5 +1,6 @@
 import { deleteBooksWithHashInvalidation } from '../../db/book-file-hash-history';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -99,7 +100,10 @@ export interface ApplyBookMoveInput {
 
 @Injectable()
 export class BookMoveRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async findTargetLibrary(targetLibraryId: number, targetFolderId: number): Promise<MoveTargetLibrary | null> {
     const [row] = await this.db
@@ -409,6 +413,7 @@ export class BookMoveRepository {
       }
 
       await reselectPrimaryFile(tx, input.bookId, input.targetLibraryId);
+      await this.searchCapture?.enqueue(tx, mergedBookId === null ? [input.bookId] : [input.bookId, mergedBookId]);
 
       return { moved: true, mergedBookId };
     });

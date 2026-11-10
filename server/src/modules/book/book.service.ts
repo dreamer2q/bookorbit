@@ -12,7 +12,8 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { mkdtemp, rm, stat, rename } from 'fs/promises';
-import { inArray, type SQL } from 'drizzle-orm';
+import { and, inArray, type SQL } from 'drizzle-orm';
+import { BookIndexSearchService } from './search/book-index-search.service';
 
 import { MAX_BOOK_QUERY_OFFSET_ROWS, isBookQueryOffsetWithinLimit } from '../../common/constants/pagination.constants';
 import { chapterProvenance, normalizeAudiobookChapters, resolveStoredAudiobookChapters } from '../../common/utils/audiobook-chapters.utils';
@@ -346,6 +347,7 @@ export class BookService {
     @Optional() private readonly audiobookChapters?: AudiobookChaptersService,
     @Optional() private readonly providerIdStore?: ProviderIdStore,
     @Optional() private readonly providerRegistry?: ProviderRegistry,
+    @Optional() private readonly bookIndexSearch?: BookIndexSearchService,
   ) {
     this.appDataPath = this.config.get<string>('storage.appDataPath')!;
   }
@@ -1168,6 +1170,8 @@ export class BookService {
     this.assertPaginationWindow(query.pagination.page, query.pagination.size);
     await this.libraryService.verifyUserAccess(user.id, libraryId, this.isSuperuser(user));
     const timeZone = this.resolveUserTimeZone(user);
+    const indexed = await this.tryIndexedQuery(user, query, [libraryId], timeZone, libraryId);
+    if (indexed) return indexed;
     const where = this.queryBuilder.buildWhere(query.filter, {
       accessibleLibraryIds: [libraryId],
       implicitLibraryId: libraryId,
@@ -1194,7 +1198,7 @@ export class BookService {
     const formatFilter = withoutRootFormatRules(query.filter);
     const formatWhere = formatFilter === query.filter ? where : this.queryBuilder.buildWhere(formatFilter, { ...scope, q: query.q });
     const hasQuery = Boolean(query.q?.trim());
-    const narrowed = Boolean(query.filter) || hasQuery;
+    const narrowed = Boolean(query.filter?.rules?.length) || hasQuery;
 
     const [total, libraryTotal, formatCounts] = await Promise.all([
       this.bookRepo.countWhere(where),
@@ -1217,6 +1221,8 @@ export class BookService {
     const libs = await this.libraryService.findAll(user);
     const accessibleLibraryIds = libs.map((l) => l.id);
     const timeZone = this.resolveUserTimeZone(user);
+    const indexed = await this.tryIndexedQuery(user, query, accessibleLibraryIds, timeZone);
+    if (indexed) return indexed;
     const where = this.queryBuilder.buildWhere(query.filter, {
       accessibleLibraryIds,
       userId: user.id,
@@ -1225,6 +1231,33 @@ export class BookService {
       contentFilters: this.isSuperuser(user) ? undefined : user.contentFilters,
     });
     return this.executeBooksQuery(user.id, where, query);
+  }
+
+  private async tryIndexedQuery(user: RequestUser, query: BookQuery, accessibleLibraryIds: number[], timeZone: string, implicitLibraryId?: number) {
+    const contentFilters = this.isSuperuser(user) ? undefined : user.contentFilters;
+    return this.bookIndexSearch?.tryQuery({
+      query,
+      libraryIds: accessibleLibraryIds,
+      contentFilters,
+      loadCards: async (ids) => {
+        const constraints = this.queryBuilder.buildWhere(query.filter, {
+          accessibleLibraryIds,
+          ...(implicitLibraryId !== undefined ? { implicitLibraryId } : {}),
+          userId: user.id,
+          timeZone,
+          contentFilters,
+        });
+        const result = await this.executeBooksQuery(user.id, and(constraints, inArray(books.id, ids)), {
+          ...query,
+          q: undefined,
+          // Hydrate only this bounded page; the provider owns its final ordering.
+          // Native relevance cannot be built after deliberately removing q.
+          sort: [{ field: 'title', dir: 'asc' }],
+          pagination: { page: 0, size: ids.length },
+        });
+        return result.items;
+      },
+    });
   }
 
   /**
@@ -1302,6 +1335,9 @@ export class BookService {
         limit: size,
         offset: page * size,
         userId,
+        ...(query.sort.length === 0 || (query.sort.length === 1 && query.sort[0].field === 'title')
+          ? { nativeTitleDirection: query.sort[0]?.dir ?? 'asc' }
+          : {}),
       });
     const bookIds = rows.map((r) => r.id);
     const customMetadataRows = await this.customMetadataService.getCardValues(bookIds);

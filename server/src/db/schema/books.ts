@@ -118,6 +118,7 @@ export const bookFiles = pgTable(
     index('book_files_file_hash_idx').on(t.fileHash),
     index('book_files_ino_idx').on(t.ino),
     index('book_files_format_idx').on(t.format),
+    index('book_files_format_book_id_idx').on(t.format, t.bookId),
     index('book_files_media_overlay_available_idx')
       .on(t.mediaOverlayAvailable)
       .where(sql`${t.mediaOverlayAvailable} = true`),

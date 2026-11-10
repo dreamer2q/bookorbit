@@ -1,0 +1,1 @@
+ALTER TABLE "book_search"."state" ADD COLUMN "engine_identity" varchar(64) DEFAULT '' NOT NULL;

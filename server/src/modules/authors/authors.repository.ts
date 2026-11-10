@@ -1,4 +1,5 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 import { SQL, and, asc, desc, eq, exists, inArray, isNull, max, or, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -66,7 +67,10 @@ export type AuthorEnrichmentRow = AuthorSummaryRow & {
 
 @Injectable()
 export class AuthorsRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async findPage(params: {
     q?: string;
@@ -348,8 +352,12 @@ export class AuthorsRepository {
       metadataProviderPinned: boolean;
       lastEnrichedAt: Date | null;
     }>,
-  ) {
-    const [updated] = await this.db.update(authors).set(values).where(eq(authors.id, authorId)).returning({
+    executor: Pick<Db, 'update' | 'execute' | 'insert' | 'select'> = this.db,
+  ): Promise<Pick<typeof authors.$inferSelect, 'id' | 'name' | 'sortName' | 'description' | 'hasPhoto' | 'lastEnrichedAt'> | null> {
+    const capture = this.searchCapture?.enabled && values.name !== undefined;
+    if (capture && executor === this.db) return this.db.transaction((tx) => this.updateAuthorById(authorId, values, tx));
+    if (capture) await executor.select({ id: authors.id }).from(authors).where(eq(authors.id, authorId)).for('update');
+    const [updated] = await executor.update(authors).set(values).where(eq(authors.id, authorId)).returning({
       id: authors.id,
       name: authors.name,
       sortName: authors.sortName,
@@ -358,8 +366,9 @@ export class AuthorsRepository {
       lastEnrichedAt: authors.lastEnrichedAt,
     });
     if (updated && (values.name !== undefined || values.sortName !== undefined)) {
-      await refreshPrimaryAuthorSortNamesForAuthors(this.db, [authorId]);
+      await refreshPrimaryAuthorSortNamesForAuthors(executor, [authorId]);
     }
+    if (updated && capture) await this.searchCapture!.enqueueAuthors(executor, [authorId]);
     return updated ?? null;
   }
 
@@ -412,6 +421,13 @@ export class AuthorsRepository {
     if (sourceAuthorIds.length === 0) return;
 
     await this.db.transaction(async (tx) => {
+      if (this.searchCapture?.enabled)
+        await tx
+          .select({ id: authors.id })
+          .from(authors)
+          .where(inArray(authors.id, [...new Set([targetAuthorId, ...sourceAuthorIds])]))
+          .orderBy(asc(authors.id))
+          .for('update');
       const sourceRelations = await tx
         .select({
           bookId: bookAuthors.bookId,
@@ -439,6 +455,10 @@ export class AuthorsRepository {
         tx,
         sourceRelations.map((row) => row.bookId),
       );
+      await this.searchCapture?.enqueue(
+        tx,
+        sourceRelations.map((row) => row.bookId),
+      );
     });
   }
 
@@ -446,6 +466,8 @@ export class AuthorsRepository {
     if (authorIds.length === 0) return;
 
     await this.db.transaction(async (tx) => {
+      if (this.searchCapture?.enabled)
+        await tx.select({ id: authors.id }).from(authors).where(inArray(authors.id, authorIds)).orderBy(asc(authors.id)).for('update');
       const relations = await tx
         .select({
           bookId: bookAuthors.bookId,
@@ -455,6 +477,10 @@ export class AuthorsRepository {
       await tx.delete(bookAuthors).where(inArray(bookAuthors.authorId, authorIds));
       await tx.delete(authors).where(inArray(authors.id, authorIds));
       await refreshPrimaryAuthorSortNamesForBooks(
+        tx,
+        relations.map((row) => row.bookId),
+      );
+      await this.searchCapture?.enqueue(
         tx,
         relations.map((row) => row.bookId),
       );

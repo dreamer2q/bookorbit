@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { asc, eq, inArray, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -6,6 +6,7 @@ import { DB } from '../../db';
 import * as schema from '../../db/schema';
 import { bookMetadata, bookSeries, bookSeriesMemberships, books } from '../../db/schema';
 import { SeriesIdentityService } from './series-identity.service';
+import { BookSearchCaptureService } from './book-search-capture.service';
 
 type Db = NodePgDatabase<typeof schema>;
 type DbTransaction = Parameters<Parameters<Db['transaction']>[0]>[0];
@@ -30,6 +31,7 @@ export class SeriesMembershipService {
   constructor(
     @Inject(DB) private readonly db: Db,
     private readonly seriesIdentity: SeriesIdentityService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   async replaceForBook(
@@ -37,6 +39,9 @@ export class SeriesMembershipService {
     memberships: readonly SeriesMembershipInput[] | null | undefined,
     executor: SeriesMembershipExecutor = this.db,
   ): Promise<SeriesMembershipRef[]> {
+    if (this.searchCapture?.enabled && executor === this.db) {
+      return this.db.transaction((tx) => this.replaceForBook(bookId, memberships, tx));
+    }
     const normalized = await this.normalizeMemberships(memberships ?? [], executor);
 
     await executor.delete(bookSeriesMemberships).where(eq(bookSeriesMemberships.bookId, bookId));
@@ -57,6 +62,9 @@ export class SeriesMembershipService {
   }
 
   async syncPrimaryFromMetadata(bookId: number, executor: SeriesMembershipExecutor = this.db): Promise<SeriesMembershipRef[]> {
+    if (this.searchCapture?.enabled && executor === this.db) {
+      return this.db.transaction((tx) => this.syncPrimaryFromMetadata(bookId, tx));
+    }
     const [metadata] = await executor
       .select({
         seriesId: bookMetadata.seriesId,
@@ -153,6 +161,9 @@ export class SeriesMembershipService {
     memberships: readonly SeriesMembershipRef[],
     executor: SeriesMembershipExecutor = this.db,
   ): Promise<void> {
+    if (this.searchCapture?.enabled && executor === this.db) {
+      return this.db.transaction((tx) => this.syncPrimaryMetadata(bookId, memberships, tx));
+    }
     const primary = memberships[0] ?? null;
     await executor
       .update(bookMetadata)
@@ -163,7 +174,16 @@ export class SeriesMembershipService {
         updatedAt: new Date(),
       })
       .where(eq(bookMetadata.bookId, bookId));
-    await executor.update(books).set({ updatedAt: new Date() }).where(eq(books.id, bookId));
+    const updated = executor.update(books).set({ updatedAt: new Date() }).where(eq(books.id, bookId));
+    if (this.searchCapture?.enabled) {
+      const rows = await updated.returning({ id: books.id });
+      await this.searchCapture.enqueue(
+        executor,
+        rows.map((row) => row.id),
+      );
+    } else {
+      await updated;
+    }
   }
 
   private async normalizeMemberships(

@@ -1,6 +1,8 @@
 import { retainFinishedReads } from '../../db/reading-attempt-retention';
 import { deleteLibraryFoldersWithHashInvalidation } from '../../db/book-file-hash-history';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
+import { enqueueBookSearchSelection } from '../../db/book-search-changes';
 import { and, asc, eq, getTableColumns, gt, inArray, isNotNull, lte, or, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { APP_FEATURES, type AccessLevel, type ContentFilterRules, type LibraryStats } from '@bookorbit/types';
@@ -37,7 +39,10 @@ const podcastShowCount = sql<number | null>`case when ${libraries.type} = 'podca
 
 @Injectable()
 export class LibraryRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   findAll() {
     return this.db
@@ -288,16 +293,35 @@ export class LibraryRepository {
   /** The library's books go with it by cascade; their finished reads stay in each reader's history. */
   delete(id: number) {
     return this.db.transaction(async (tx) => {
+      if (this.searchCapture?.enabled) await tx.select({ id: libraries.id }).from(libraries).where(eq(libraries.id, id)).for('update');
       await retainFinishedReads(tx, eq(books.libraryId, id));
+      if (this.searchCapture?.enabled) {
+        await tx.execute(sql`WITH source_books AS MATERIALIZED (
+          SELECT id AS book_id FROM ${books} WHERE library_id = ${id}
+        ), deleted_library AS (
+          DELETE FROM ${libraries} WHERE id = ${id} AND (SELECT count(*) FROM source_books) >= 0 RETURNING id
+        ), ${enqueueBookSearchSelection(sql`SELECT book_id FROM source_books`, sql`SELECT count(*) FROM deleted_library`)}`);
+        return;
+      }
       await tx.delete(libraries).where(eq(libraries.id, id));
     });
   }
 
   deleteFolder(id: number) {
+    if (this.searchCapture?.enabled)
+      return this.db.transaction(async (tx) => {
+        await tx.select({ id: libraryFolders.id }).from(libraryFolders).where(eq(libraryFolders.id, id)).for('update');
+        await deleteLibraryFoldersWithHashInvalidation(tx, eq(libraryFolders.id, id), { captureSearch: true });
+      });
     return deleteLibraryFoldersWithHashInvalidation(this.db, eq(libraryFolders.id, id));
   }
 
   deleteFoldersByLibrary(libraryId: number) {
+    if (this.searchCapture?.enabled)
+      return this.db.transaction(async (tx) => {
+        await tx.select({ id: libraries.id }).from(libraries).where(eq(libraries.id, libraryId)).for('update');
+        await deleteLibraryFoldersWithHashInvalidation(tx, eq(libraryFolders.libraryId, libraryId), { captureSearch: true });
+      });
     return deleteLibraryFoldersWithHashInvalidation(this.db, eq(libraryFolders.libraryId, libraryId));
   }
 

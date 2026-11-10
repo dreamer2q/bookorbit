@@ -1,4 +1,5 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, NotFoundException, Optional } from '@nestjs/common';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
 import { and, asc, count, desc, eq, exists, inArray, notExists, or, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -53,6 +54,7 @@ export class AuthorStrategy implements EntityStrategy {
     private readonly authorsRepo: AuthorsRepository,
     private readonly authorImageStorage: AuthorImageStorageService,
     private readonly enrichmentOrchestrator: AuthorEnrichmentOrchestratorService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   async findCandidatePairs(libraryIds: number[], minSimilarity: number): Promise<RawCandidatePair[]> {
@@ -318,8 +320,17 @@ export class AuthorStrategy implements EntityStrategy {
     const affectedBookIds = await this.findAffectedBookIds([entityId]);
 
     if (input.mode === 'soft') {
-      await this.db.delete(bookAuthors).where(eq(bookAuthors.authorId, entityId));
-      await refreshPrimaryAuthorSortNamesForBooks(this.db, affectedBookIds);
+      if (this.searchCapture?.enabled)
+        await this.db.transaction(async (tx) => {
+          const deleted = await tx.delete(bookAuthors).where(eq(bookAuthors.authorId, entityId)).returning({ id: bookAuthors.bookId });
+          const ids = deleted.map((row) => row.id);
+          await refreshPrimaryAuthorSortNamesForBooks(tx, ids);
+          await this.searchCapture!.enqueue(tx, ids);
+        });
+      else {
+        await this.db.delete(bookAuthors).where(eq(bookAuthors.authorId, entityId));
+        await refreshPrimaryAuthorSortNamesForBooks(this.db, affectedBookIds);
+      }
     } else {
       await this.authorsRepo.deleteAuthors([entityId]);
       await this.authorImageStorage.deleteAuthorDir(entityId);
@@ -337,6 +348,7 @@ export class AuthorStrategy implements EntityStrategy {
     const newEntities: { id: number; name: string }[] = [];
 
     await this.db.transaction(async (tx) => {
+      if (this.searchCapture?.enabled) await tx.select({ id: authors.id }).from(authors).where(eq(authors.id, input.entityId)).for('update');
       const seenNewNames = new Set<string>();
       for (const name of input.newNames) {
         const displayName = normalizeMetadataText(name);
@@ -376,6 +388,10 @@ export class AuthorStrategy implements EntityStrategy {
       await tx.delete(bookAuthors).where(eq(bookAuthors.authorId, input.entityId));
       await tx.delete(authors).where(eq(authors.id, input.entityId));
       await refreshPrimaryAuthorSortNamesForBooks(tx, affectedBookIds);
+      await this.searchCapture?.enqueue(
+        tx,
+        bookRows.map((row) => row.bookId),
+      );
     });
 
     await this.authorImageStorage.deleteAuthorDir(input.entityId);

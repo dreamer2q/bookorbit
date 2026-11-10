@@ -8,6 +8,8 @@ import { refreshPrimaryAuthorSortNamesForAuthors, refreshPrimaryAuthorSortNamesF
 import * as schema from '../../../db/schema';
 import { SeriesIdentityService } from '../../../common/services/series-identity.service';
 import { SeriesMembershipService } from '../../../common/services/series-membership.service';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
+import { withDeferredBookSearchChanges } from '../../../db/book-search-changes';
 import {
   aggregateReadingSessionDailyStats,
   getDayRangeForDateKeys,
@@ -106,20 +108,22 @@ export class MigrationImportRepository {
     @Inject(DB) private readonly db: Db,
     @Optional() private readonly seriesIdentity?: SeriesIdentityService,
     @Optional() private readonly seriesMemberships?: SeriesMembershipService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   async withTransaction<T>(handler: (repo: MigrationImportRepository) => Promise<T>): Promise<T> {
     return this.db.transaction(async (tx) => {
-      const repo = new MigrationImportRepository(tx as unknown as Db, this.seriesIdentity, this.seriesMemberships);
+      const repo = new MigrationImportRepository(tx as unknown as Db, this.seriesIdentity, this.seriesMemberships, this.searchCapture);
       repo.inTransaction = true;
-      return handler(repo);
+      return this.searchCapture?.enabled ? withDeferredBookSearchChanges(tx, () => handler(repo)) : handler(repo);
     });
   }
 
   // --- Metadata ---
 
   async upsertBookMetadata(bookId: number, values: Partial<typeof schema.bookMetadata.$inferInsert>): Promise<void> {
-    if (!this.inTransaction && Object.prototype.hasOwnProperty.call(values, 'chapters'))
+    const capture = this.searchCapture?.capturesMetadata(values) ?? false;
+    if (!this.inTransaction && (Object.prototype.hasOwnProperty.call(values, 'chapters') || capture))
       return this.withTransaction((repo) => repo.upsertBookMetadata(bookId, values));
     const shouldSyncSeries =
       Object.prototype.hasOwnProperty.call(values, 'seriesName') || Object.prototype.hasOwnProperty.call(values, 'seriesIndex');
@@ -131,13 +135,19 @@ export class MigrationImportRepository {
     if (shouldSyncSeries) {
       await this.seriesMemberships?.syncPrimaryFromMetadata(bookId, this.db);
     }
+    if (capture) await this.searchCapture!.enqueue(this.db, [bookId]);
   }
 
   // --- Authors ---
 
   async deleteBookAuthors(bookId: number): Promise<void> {
-    await this.db.delete(schema.bookAuthors).where(eq(schema.bookAuthors.bookId, bookId));
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.deleteBookAuthors(bookId));
+    const deletion = this.db.delete(schema.bookAuthors).where(eq(schema.bookAuthors.bookId, bookId));
+    let changedIds: number[] = [];
+    if (this.searchCapture?.enabled) changedIds = (await deletion.returning({ id: schema.bookAuthors.bookId })).map((row) => row.id);
+    else await deletion;
     await refreshPrimaryAuthorSortNamesForBooks(this.db, [bookId]);
+    await this.searchCapture?.enqueue(this.db, changedIds);
   }
 
   async upsertAuthor(values: typeof schema.authors.$inferInsert): Promise<{ id: number } | null> {
@@ -151,14 +161,28 @@ export class MigrationImportRepository {
   }
 
   async insertBookAuthor(bookId: number, authorId: number, displayOrder: number): Promise<void> {
-    await this.db.insert(schema.bookAuthors).values({ bookId, authorId, displayOrder }).onConflictDoNothing();
+    if (!this.inTransaction && this.searchCapture?.enabled)
+      return this.withTransaction((repo) => repo.insertBookAuthor(bookId, authorId, displayOrder));
+    const insertion = this.db.insert(schema.bookAuthors).values({ bookId, authorId, displayOrder }).onConflictDoNothing();
+    let changedIds: number[] = [];
+    if (this.searchCapture?.enabled) changedIds = (await insertion.returning({ id: schema.bookAuthors.bookId })).map((row) => row.id);
+    else await insertion;
     await refreshPrimaryAuthorSortNamesForBooks(this.db, [bookId]);
+    await this.searchCapture?.enqueue(this.db, changedIds);
   }
 
   // --- Narrators ---
 
   async deleteBookNarrators(bookId: number): Promise<void> {
-    await this.db.delete(schema.bookNarrators).where(eq(schema.bookNarrators.bookId, bookId));
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.deleteBookNarrators(bookId));
+    const deletion = this.db.delete(schema.bookNarrators).where(eq(schema.bookNarrators.bookId, bookId));
+    if (this.searchCapture?.enabled) {
+      const rows = await deletion.returning({ id: schema.bookNarrators.bookId });
+      await this.searchCapture.enqueue(
+        this.db,
+        rows.map((row) => row.id),
+      );
+    } else await deletion;
   }
 
   async upsertNarrator(values: { name: string; sortName: string }): Promise<{ id: number } | null> {
@@ -171,7 +195,16 @@ export class MigrationImportRepository {
   }
 
   async insertBookNarrator(bookId: number, narratorId: number, displayOrder: number): Promise<void> {
-    await this.db.insert(schema.bookNarrators).values({ bookId, narratorId, displayOrder }).onConflictDoNothing();
+    if (!this.inTransaction && this.searchCapture?.enabled)
+      return this.withTransaction((repo) => repo.insertBookNarrator(bookId, narratorId, displayOrder));
+    const insertion = this.db.insert(schema.bookNarrators).values({ bookId, narratorId, displayOrder }).onConflictDoNothing();
+    if (this.searchCapture?.enabled) {
+      const rows = await insertion.returning({ id: schema.bookNarrators.bookId });
+      await this.searchCapture.enqueue(
+        this.db,
+        rows.map((row) => row.id),
+      );
+    } else await insertion;
   }
 
   // --- Genres ---
@@ -375,9 +408,13 @@ export class MigrationImportRepository {
 
   async batchUpsertBookMetadata(items: Array<{ bookId: number } & Partial<typeof schema.bookMetadata.$inferInsert>>): Promise<void> {
     if (items.length === 0) return;
-    if (!this.inTransaction && items.some((item) => Object.prototype.hasOwnProperty.call(item, 'chapters')))
+    if (
+      !this.inTransaction &&
+      items.some((item) => Object.prototype.hasOwnProperty.call(item, 'chapters') || this.searchCapture?.capturesMetadata(item))
+    )
       return this.withTransaction((repo) => repo.batchUpsertBookMetadata(items));
     for (const batch of chunk(items, BATCH_CHUNK_SIZE)) {
+      const changedIds: number[] = [];
       for (const item of batch) {
         const shouldSyncSeries =
           Object.prototype.hasOwnProperty.call(item, 'seriesName') || Object.prototype.hasOwnProperty.call(item, 'seriesIndex');
@@ -393,15 +430,22 @@ export class MigrationImportRepository {
         if (shouldSyncSeries) {
           await this.seriesMemberships?.syncPrimaryFromMetadata(item.bookId, this.db);
         }
+        if (this.searchCapture?.capturesMetadata(item)) changedIds.push(item.bookId);
       }
+      await this.searchCapture?.enqueue(this.db, changedIds);
     }
   }
 
   async batchDeleteBookAuthors(bookIds: number[]): Promise<void> {
     if (bookIds.length === 0) return;
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.batchDeleteBookAuthors(bookIds));
     for (const batch of chunk(bookIds, BATCH_CHUNK_SIZE)) {
-      await this.db.delete(schema.bookAuthors).where(inArray(schema.bookAuthors.bookId, batch));
+      const deletion = this.db.delete(schema.bookAuthors).where(inArray(schema.bookAuthors.bookId, batch));
+      let changedIds: number[] = [];
+      if (this.searchCapture?.enabled) changedIds = (await deletion.returning({ id: schema.bookAuthors.bookId })).map((row) => row.id);
+      else await deletion;
       await refreshPrimaryAuthorSortNamesForBooks(this.db, batch);
+      await this.searchCapture?.enqueue(this.db, changedIds);
     }
   }
 
@@ -425,19 +469,32 @@ export class MigrationImportRepository {
 
   async batchInsertBookAuthors(items: Array<{ bookId: number; authorId: number; displayOrder: number }>): Promise<void> {
     if (items.length === 0) return;
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.batchInsertBookAuthors(items));
     for (const batch of chunk(items, BATCH_CHUNK_SIZE)) {
-      await this.db.insert(schema.bookAuthors).values(batch).onConflictDoNothing();
+      const insertion = this.db.insert(schema.bookAuthors).values(batch).onConflictDoNothing();
+      let changedIds: number[] = [];
+      if (this.searchCapture?.enabled) changedIds = (await insertion.returning({ id: schema.bookAuthors.bookId })).map((row) => row.id);
+      else await insertion;
       await refreshPrimaryAuthorSortNamesForBooks(
         this.db,
         batch.map((item) => item.bookId),
       );
+      await this.searchCapture?.enqueue(this.db, changedIds);
     }
   }
 
   async batchDeleteBookNarrators(bookIds: number[]): Promise<void> {
     if (bookIds.length === 0) return;
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.batchDeleteBookNarrators(bookIds));
     for (const batch of chunk(bookIds, BATCH_CHUNK_SIZE)) {
-      await this.db.delete(schema.bookNarrators).where(inArray(schema.bookNarrators.bookId, batch));
+      const deletion = this.db.delete(schema.bookNarrators).where(inArray(schema.bookNarrators.bookId, batch));
+      if (this.searchCapture?.enabled) {
+        const rows = await deletion.returning({ id: schema.bookNarrators.bookId });
+        await this.searchCapture.enqueue(
+          this.db,
+          rows.map((row) => row.id),
+        );
+      } else await deletion;
     }
   }
 
@@ -457,8 +514,16 @@ export class MigrationImportRepository {
 
   async batchInsertBookNarrators(items: Array<{ bookId: number; narratorId: number; displayOrder: number }>): Promise<void> {
     if (items.length === 0) return;
+    if (!this.inTransaction && this.searchCapture?.enabled) return this.withTransaction((repo) => repo.batchInsertBookNarrators(items));
     for (const batch of chunk(items, BATCH_CHUNK_SIZE)) {
-      await this.db.insert(schema.bookNarrators).values(batch).onConflictDoNothing();
+      const insertion = this.db.insert(schema.bookNarrators).values(batch).onConflictDoNothing();
+      if (this.searchCapture?.enabled) {
+        const rows = await insertion.returning({ id: schema.bookNarrators.bookId });
+        await this.searchCapture.enqueue(
+          this.db,
+          rows.map((row) => row.id),
+        );
+      } else await insertion;
     }
   }
 

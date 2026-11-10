@@ -9,6 +9,8 @@ import { createPostgresClientConfig } from '../db/postgres-connection-config';
 import { dropUnreleasedMigrationRows, reconcileMigrationLedgerTimestamps } from './migration-ledger-compatibility';
 import { installPostgresExtensions } from './postgres-extensions';
 import { prepareLegacySeriesIndexColumns } from './series-index-migration-compatibility';
+import { appConfig } from '../config/config';
+import { applyBookSearchMigrations } from './book-search-migrations';
 
 function resolveMigrationsFolder(): string {
   const candidates = [
@@ -50,6 +52,10 @@ async function runMigrations() {
     await migrate(drizzle(pool), { migrationsFolder });
 
     console.log(`Migrations applied successfully from ${migrationsFolder}`);
+    if (appConfig().bookSearch.enabled) {
+      await applyBookSearchMigrations(pool);
+      console.log('Book search migrations applied using their independent ledger');
+    }
   } finally {
     await pool.end();
   }

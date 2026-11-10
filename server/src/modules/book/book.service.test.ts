@@ -128,6 +128,7 @@ function makeService(
     positionConverter?: unknown;
     seriesMemberships?: unknown;
     seriesExpectedCount?: unknown;
+    bookIndexSearch?: unknown;
   } = {},
 ) {
   const bookRepo = {
@@ -344,6 +345,10 @@ function makeService(
     undefined,
     undefined,
     overrides.positionConverter as never,
+    undefined,
+    undefined,
+    undefined,
+    overrides.bookIndexSearch as never,
   );
 
   return {
@@ -3758,6 +3763,7 @@ describe('BookService', () => {
         limit: 5,
         offset: 5,
         userId: 42,
+        nativeTitleDirection: 'asc',
       });
       expect(result.total).toBe(1);
       expect(result.page).toBe(1);
@@ -4144,6 +4150,93 @@ describe('BookService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
+    it('globalQuery hydrates an indexed page using current native permissions and offset zero', async () => {
+      const bookIndexSearch = {
+        tryQuery: vi.fn().mockImplementation(async (context: { loadCards: (ids: number[]) => Promise<unknown[]> }) => ({
+          items: await context.loadCards([4, 2]),
+          total: 50,
+          page: 2,
+          size: 2,
+        })),
+      };
+      const { service, libraryService, queryBuilder } = makeService({ bookIndexSearch });
+      const user = makeUser({ id: 7 });
+      libraryService.findAll.mockResolvedValue([{ id: 3 }]);
+      const nativeQuery = vi
+        .spyOn(service, 'executeBooksQuery')
+        .mockResolvedValue({ items: [makeBookCard(4), makeBookCard(2)], total: 2, page: 0, size: 2 });
+      const request: BookQuery = { q: '英语', sort: [{ field: 'title', dir: 'asc' }], pagination: { page: 2, size: 2 } };
+      const result = await service.globalQuery(user, request);
+      expect(result.total).toBe(50);
+      expect(result.page).toBe(2);
+      expect(queryBuilder.buildWhere).toHaveBeenCalledWith(undefined, {
+        accessibleLibraryIds: [3],
+        userId: 7,
+        timeZone: 'UTC',
+        contentFilters: EMPTY_CONTENT_FILTER_RULES,
+      });
+      expect(nativeQuery).toHaveBeenCalledWith(7, expect.anything(), expect.objectContaining({ q: undefined, pagination: { page: 0, size: 2 } }));
+      expect(bookIndexSearch.tryQuery).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [3], contentFilters: EMPTY_CONTENT_FILTER_RULES }));
+    });
+
+    it('globalQuery retains the complete original query when indexed search falls back', async () => {
+      const bookIndexSearch = { tryQuery: vi.fn().mockResolvedValue(null) };
+      const { service, libraryService, queryBuilder } = makeService({ bookIndexSearch });
+      const user = makeUser({ id: 7 });
+      libraryService.findAll.mockResolvedValue([{ id: 3 }]);
+      vi.spyOn(service, 'executeBooksQuery').mockResolvedValue({ items: [], total: 0, page: 2, size: 2 });
+      const request: BookQuery = { q: '英语', sort: [{ field: 'title', dir: 'asc' }], pagination: { page: 2, size: 2 } };
+      await service.globalQuery(user, request);
+      expect(queryBuilder.buildWhere).toHaveBeenCalledWith(
+        undefined,
+        expect.objectContaining({ q: '英语', accessibleLibraryIds: [3], contentFilters: EMPTY_CONTENT_FILTER_RULES }),
+      );
+      expect(service.executeBooksQuery).toHaveBeenCalledWith(7, undefined, request);
+    });
+
+    it.each([undefined, 3])('hydrates top-search relevance without an invalid native relevance sort, library=%s', async (libraryId) => {
+      const bookIndexSearch = {
+        tryQuery: vi.fn().mockImplementation(async (context: { loadCards: (ids: number[]) => Promise<unknown[]> }) => ({
+          items: await context.loadCards([4, 2]),
+          total: 50,
+          page: 0,
+          size: 5,
+        })),
+      };
+      const { service, libraryService, queryBuilder } = makeService({ bookIndexSearch });
+      libraryService.findAll.mockResolvedValue([{ id: 3 }]);
+      const nativeQuery = vi
+        .spyOn(service, 'executeBooksQuery')
+        .mockResolvedValue({ items: [makeBookCard(4), makeBookCard(2)], total: 2, page: 0, size: 2 });
+      const query: BookQuery = { q: '英语', sort: [{ field: 'relevance', dir: 'desc' }], pagination: { page: 0, size: 5 } };
+      const user = makeUser({ id: 7 });
+      const result = libraryId === undefined ? await service.globalQuery(user, query) : await service.queryForLibrary(user, libraryId, query);
+      expect(result.total).toBe(50);
+      expect(nativeQuery).toHaveBeenCalledWith(
+        7,
+        expect.anything(),
+        expect.objectContaining({ q: undefined, sort: [{ field: 'title', dir: 'asc' }], pagination: { page: 0, size: 2 } }),
+      );
+      expect(bookIndexSearch.tryQuery).toHaveBeenCalledWith(expect.objectContaining({ query, libraryIds: [3] }));
+      if (libraryId !== undefined) {
+        expect(libraryService.verifyUserAccess).toHaveBeenCalledWith(7, libraryId, false);
+        expect(queryBuilder.buildWhere).toHaveBeenCalledWith(
+          undefined,
+          expect.objectContaining({ implicitLibraryId: libraryId, accessibleLibraryIds: [3] }),
+        );
+      }
+    });
+
+    it('rejects an inaccessible library before calling indexed search', async () => {
+      const bookIndexSearch = { tryQuery: vi.fn() };
+      const { service, libraryService } = makeService({ bookIndexSearch });
+      libraryService.verifyUserAccess.mockRejectedValue(new ForbiddenException());
+      await expect(
+        service.queryForLibrary(makeUser(), 99, { q: '英语', sort: [{ field: 'relevance', dir: 'desc' }], pagination: { page: 0, size: 5 } }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(bookIndexSearch.tryQuery).not.toHaveBeenCalled();
+    });
+
     it('globalQuery uses accessible libraries and assembled cards', async () => {
       const { service, libraryService, queryBuilder, bookRepo } = makeService();
       const user = makeUser({ id: 7 });
@@ -4175,6 +4268,7 @@ describe('BookService', () => {
         limit: 10,
         offset: 0,
         userId: 7,
+        nativeTitleDirection: 'asc',
       });
     });
 
@@ -5978,6 +6072,7 @@ describe('BookService', () => {
         limit: 50,
         offset: 0,
         userId: 12,
+        nativeTitleDirection: 'asc',
       });
       expect(bookRepo.findCardsCollapsed).not.toHaveBeenCalled();
       expect(result).toEqual({ items: [], total: 0, page: 0, size: 50 });
@@ -6211,6 +6306,7 @@ describe('BookService', () => {
         limit: 50,
         offset: 0,
         userId: 12,
+        nativeTitleDirection: 'asc',
       });
       expect(bookRepo.findCardsCollapsed).not.toHaveBeenCalled();
     });

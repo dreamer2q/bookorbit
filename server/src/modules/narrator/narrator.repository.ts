@@ -1,10 +1,12 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { eq, inArray } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { DB } from '../../db';
 import * as schema from '../../db/schema';
 import { bookNarrators, narrators } from '../../db/schema';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
+import { withDeferredBookSearchChanges } from '../../db/book-search-changes';
 import {
   chooseCanonicalMetadataTextRow,
   normalizeMetadataText,
@@ -18,7 +20,10 @@ const NORMALIZED_NARRATOR_NAME_SQL = normalizeMetadataTextKeySql(narrators.name)
 
 @Injectable()
 export class NarratorRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async replaceForBook(bookId: number, names: { name: string; sortName: string | null }[], executor?: NarratorMutationExecutor): Promise<void> {
     if (executor) {
@@ -27,7 +32,9 @@ export class NarratorRepository {
     }
 
     await this.db.transaction(async (tx) => {
-      await this.replaceForBookWithExecutor(tx, bookId, names);
+      const replace = () => this.replaceForBookWithExecutor(tx, bookId, names);
+      if (this.searchCapture?.enabled) await withDeferredBookSearchChanges(tx, replace);
+      else await replace();
     });
   }
 
@@ -38,7 +45,10 @@ export class NarratorRepository {
   ): Promise<void> {
     await executor.delete(bookNarrators).where(eq(bookNarrators.bookId, bookId));
 
-    if (names.length === 0) return;
+    if (names.length === 0) {
+      await this.searchCapture?.enqueue(executor, [bookId]);
+      return;
+    }
 
     const uniqueByName = new Map<string, { name: string; sortName: string | null }>();
     for (const value of names) {
@@ -50,7 +60,7 @@ export class NarratorRepository {
 
     const uniqueNames = [...uniqueByName.values()];
     const narratorByNameKey = new Map<string, { id: number }>();
-    await this.addExistingNarratorsByNormalizedName(
+    const canonicalizedNarratorIds = await this.addExistingNarratorsByNormalizedName(
       executor,
       narratorByNameKey,
       uniqueNames.map((narrator) => narrator.name),
@@ -73,10 +83,12 @@ export class NarratorRepository {
       }
     }
 
-    await this.addExistingNarratorsByNormalizedName(
-      executor,
-      narratorByNameKey,
-      uniqueNames.filter((narrator) => !narratorByNameKey.has(normalizeMetadataTextKey(narrator.name) ?? '')).map((narrator) => narrator.name),
+    canonicalizedNarratorIds.push(
+      ...(await this.addExistingNarratorsByNormalizedName(
+        executor,
+        narratorByNameKey,
+        uniqueNames.filter((narrator) => !narratorByNameKey.has(normalizeMetadataTextKey(narrator.name) ?? '')).map((narrator) => narrator.name),
+      )),
     );
 
     const links = uniqueNames.flatMap((value, index) => {
@@ -89,17 +101,19 @@ export class NarratorRepository {
     if (links.length > 0) {
       await executor.insert(bookNarrators).values(links).onConflictDoNothing();
     }
+    await this.searchCapture?.enqueueNarrators(executor, canonicalizedNarratorIds);
+    await this.searchCapture?.enqueue(executor, [bookId]);
   }
 
   private async addExistingNarratorsByNormalizedName(
     executor: NarratorMutationExecutor,
     narratorByNameKey: Map<string, { id: number }>,
     names: string[],
-  ): Promise<void> {
+  ): Promise<number[]> {
     const keys = [...new Set(names.map((name) => normalizeMetadataTextKey(name)).filter((key): key is string => key !== null))].filter(
       (key) => !narratorByNameKey.has(key),
     );
-    if (keys.length === 0) return;
+    if (keys.length === 0) return [];
 
     const existingNarrators = await executor
       .select({ id: narrators.id, name: narrators.name, normalizedName: NORMALIZED_NARRATOR_NAME_SQL })
@@ -124,6 +138,7 @@ export class NarratorRepository {
       rowsByKey.set(key, rows);
     }
 
+    const canonicalizedIds: number[] = [];
     for (const [key, rows] of rowsByKey) {
       const desiredName = desiredNameByKey.get(key);
       const match = chooseCanonicalMetadataTextRow(rows, { desiredName });
@@ -131,9 +146,12 @@ export class NarratorRepository {
 
       const canonicalName = normalizeMetadataText(match.name);
       if (canonicalName && match.name !== canonicalName && !rows.some((row) => row.id !== match.id && row.name === canonicalName)) {
+        if (this.searchCapture?.enabled) await executor.select({ id: narrators.id }).from(narrators).where(eq(narrators.id, match.id)).for('update');
         await executor.update(narrators).set({ name: canonicalName }).where(eq(narrators.id, match.id));
+        canonicalizedIds.push(match.id);
       }
       narratorByNameKey.set(key, { id: match.id });
     }
+    return canonicalizedIds;
   }
 }

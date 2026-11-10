@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { SQL, and, asc, count, desc, eq, exists, inArray, notExists, or, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -23,6 +23,8 @@ import type {
   EntityBookScope,
 } from './entity-strategy.interface';
 import { buildEntityBookScopeClauses } from './entity-book-scope';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
+import { withDeferredBookSearchChanges } from '../../../db/book-search-changes';
 
 type Db = NodePgDatabase<typeof schema>;
 
@@ -46,7 +48,10 @@ export class SeriesStrategy implements EntityStrategy {
   readonly entityType = 'series' as const;
   readonly isInline = false;
 
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async findCandidatePairs(libraryIds: number[], minSimilarity: number): Promise<RawCandidatePair[]> {
     const scopedLibraryIds = numericIds(libraryIds);
@@ -193,6 +198,7 @@ export class SeriesStrategy implements EntityStrategy {
       await this.mergeMemberships(sourceIds, targetId, affectedBookIds, tx as unknown as Db);
       await this.syncPrimaryMetadataForBooks(affectedBookIds, tx as unknown as Db);
       await this.deleteUnusedSeriesRows(sourceIds, tx as unknown as Db);
+      await this.searchCapture?.enqueue(tx, affectedBookIds);
     });
 
     return { affectedBookIds };
@@ -215,16 +221,21 @@ export class SeriesStrategy implements EntityStrategy {
       };
     }
 
-    const target = await this.upsertSeries(newName);
+    const target = await this.db.transaction((tx) =>
+      withDeferredBookSearchChanges(tx, async () => {
+        // Resolve/update the shared identity in the same transaction as its members.
+        const resolved = await this.upsertSeries(newName, tx as unknown as Db);
+        if (resolved.id !== entityId) {
+          await this.mergeMemberships([entityId], resolved.id, affectedBookIds, tx as unknown as Db);
+        }
+        await this.syncPrimaryMetadataForBooks(affectedBookIds, tx as unknown as Db);
+        await this.deleteUnusedSeriesRows([entityId], tx as unknown as Db);
+        if (resolved.nameChanged) await this.searchCapture?.enqueueSeries(tx, [resolved.id]);
+        await this.searchCapture?.enqueue(tx, affectedBookIds);
+        return resolved;
+      }),
+    );
     const wasImplicitMerge = target.id !== entityId;
-
-    await this.db.transaction(async (tx) => {
-      if (wasImplicitMerge) {
-        await this.mergeMemberships([entityId], target.id, affectedBookIds, tx as unknown as Db);
-      }
-      await this.syncPrimaryMetadataForBooks(affectedBookIds, tx as unknown as Db);
-      await this.deleteUnusedSeriesRows([entityId], tx as unknown as Db);
-    });
 
     return {
       oldName: current.name,
@@ -247,6 +258,7 @@ export class SeriesStrategy implements EntityStrategy {
           .where(and(inArray(bookSeriesMemberships.bookId, affectedBookIds), eq(bookSeriesMemberships.seriesId, entityId)));
         await this.syncPrimaryMetadataForBooks(affectedBookIds, tx as unknown as Db);
         await this.deleteUnusedSeriesRows([entityId], tx as unknown as Db);
+        await this.searchCapture?.enqueue(tx, affectedBookIds);
       });
     } else if (input.mode === 'hard') {
       await this.deleteUnusedSeriesRows([entityId], this.db);
@@ -312,11 +324,14 @@ export class SeriesStrategy implements EntityStrategy {
     return row ?? null;
   }
 
-  private async upsertSeries(name: string): Promise<{ id: number; name: string }> {
+  private async upsertSeries(name: string, executor: Db = this.db): Promise<{ id: number; name: string; nameChanged?: boolean }> {
     const displayName = normalizeMetadataText(name);
     const normalized = normalizeMetadataTextKey(displayName);
     if (!displayName || !normalized) throw new BadRequestException('Name cannot be empty');
-    const [row] = await this.db
+    const [previous] = this.searchCapture?.enabled
+      ? await executor.select({ name: bookSeries.name }).from(bookSeries).where(eq(bookSeries.normalizedName, normalized)).for('update').limit(1)
+      : [];
+    const [row] = await executor
       .insert(bookSeries)
       .values({ name: displayName, normalizedName: normalized })
       .onConflictDoUpdate({
@@ -325,7 +340,7 @@ export class SeriesStrategy implements EntityStrategy {
       })
       .returning({ id: bookSeries.id, name: bookSeries.name });
     if (!row) throw new BadRequestException('Unable to resolve series');
-    return row;
+    return this.searchCapture?.enabled ? { ...row, nameChanged: previous?.name !== row.name } : row;
   }
 
   private async findAffectedBookIdsInLibraries(seriesIds: number[], libraryIds: number[] | undefined): Promise<number[]> {

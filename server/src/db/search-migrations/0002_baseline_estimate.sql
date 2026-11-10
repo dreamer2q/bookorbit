@@ -1,0 +1,1 @@
+ALTER TABLE "book_search"."baseline" ADD COLUMN "estimated_books" bigint DEFAULT 0 NOT NULL;

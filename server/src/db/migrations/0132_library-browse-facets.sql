@@ -1,0 +1,1 @@
+CREATE INDEX "book_files_format_book_id_idx" ON "book_files" USING btree ("format","book_id");

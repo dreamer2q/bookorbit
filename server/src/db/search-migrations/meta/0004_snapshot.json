@@ -1,0 +1,282 @@
+{
+  "id": "f3b60b39-9ffa-4fb0-bf67-70c4c126f735",
+  "prevId": "744b374d-9cc0-4c60-b24d-89b028341c88",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "book_search.baseline": {
+      "name": "baseline",
+      "schema": "book_search",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "index_name": {
+          "name": "index_name",
+          "type": "varchar(128)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_revision": {
+          "name": "schema_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "upper_book_id": {
+          "name": "upper_book_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cursor_book_id": {
+          "name": "cursor_book_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "seeded_count": {
+          "name": "seeded_count",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "estimated_books": {
+          "name": "estimated_books",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "seed_revision": {
+          "name": "seed_revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "orphan_cursor_book_id": {
+          "name": "orphan_cursor_book_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "pruning_complete": {
+          "name": "pruning_complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "baseline_singleton": {
+          "name": "baseline_singleton",
+          "value": "\"book_search\".\"baseline\".\"id\" = 1"
+        },
+        "baseline_range": {
+          "name": "baseline_range",
+          "value": "\"book_search\".\"baseline\".\"cursor_book_id\" >= 0 AND \"book_search\".\"baseline\".\"cursor_book_id\" <= \"book_search\".\"baseline\".\"upper_book_id\" AND \"book_search\".\"baseline\".\"seeded_count\" >= 0 AND \"book_search\".\"baseline\".\"seed_revision\" > 0 AND \"book_search\".\"baseline\".\"orphan_cursor_book_id\" >= 0"
+        },
+        "baseline_phase": {
+          "name": "baseline_phase",
+          "value": "\"book_search\".\"baseline\".\"phase\" IN ('seeding', 'catchup', 'indexed')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "book_search.pending": {
+      "name": "pending",
+      "schema": "book_search",
+      "columns": {
+        "book_id": {
+          "name": "book_id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "queued_at": {
+          "name": "queued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "pending_revision_book_idx": {
+          "name": "pending_revision_book_idx",
+          "columns": [
+            {
+              "expression": "revision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "book_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "pending_positive_ids": {
+          "name": "pending_positive_ids",
+          "value": "\"book_search\".\"pending\".\"book_id\" > 0 AND \"book_search\".\"pending\".\"revision\" > 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "book_search.state": {
+      "name": "state",
+      "schema": "book_search",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "applied_revision": {
+          "name": "applied_revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "snapshot_complete": {
+          "name": "snapshot_complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "write_coverage_complete": {
+          "name": "write_coverage_complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "index_name": {
+          "name": "index_name",
+          "type": "varchar(128)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "schema_revision": {
+          "name": "schema_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "engine_identity": {
+          "name": "engine_identity",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "capture_session": {
+          "name": "capture_session",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "state_singleton": {
+          "name": "state_singleton",
+          "value": "\"book_search\".\"state\".\"id\" = 1"
+        },
+        "state_revisions": {
+          "name": "state_revisions",
+          "value": "\"book_search\".\"state\".\"applied_revision\" >= 0 AND \"book_search\".\"state\".\"applied_revision\" <= \"book_search\".\"state\".\"revision\""
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {
+    "book_search": "book_search"
+  },
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

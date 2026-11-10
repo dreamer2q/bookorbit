@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { access as fsAccess, stat } from 'fs/promises';
 import { basename, dirname, extname, join, relative } from 'path';
@@ -9,6 +9,7 @@ import { sanitizeLogValue } from '../../common/utils/log-sanitize.utils';
 import { splitMetadataIsbn } from '../../common/text-match/isbn-normalize';
 import { buildPatternTokens, patternReferencesToken } from '../../common/utils/pattern-tokens.utils';
 import { selectPrimaryFileKeepingCurrent } from '../../common/utils/primary-file-selection.utils';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 
 import { DB } from '../../db';
 import { realignAudioTrackOrder } from '../../db/audio-track-order';
@@ -53,6 +54,7 @@ export class UploadService {
     private readonly processor: UploadProcessorService,
     private readonly moduleRef: ModuleRef,
     private readonly pathPolicy: PathPolicyService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   private resolveFileRenameService(): FileRenameService | null {
@@ -382,6 +384,7 @@ export class UploadService {
           .where(eq(books.id, bookId));
       }
 
+      await this.searchCapture?.enqueue(tx, [bookId]);
       return {
         inserted,
         isPrimary: inserted.id === nextPrimaryFileId,

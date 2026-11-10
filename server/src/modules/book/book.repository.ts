@@ -1,6 +1,6 @@
 import { recordBookFileHashHistory, deleteBookFilesWithHashInvalidation, deleteBooksWithHashInvalidation } from '../../db/book-file-hash-history';
 import { BadRequestException, Inject, Injectable, Optional } from '@nestjs/common';
-import { SQL, and, asc, count, eq, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
+import { SQL, and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
 import { SUPPORTED_BOOK_FORMATS } from '../upload/upload-validator.service';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -27,6 +27,8 @@ import { hasReachedProgressThreshold } from '../../common/utils/progress-thresho
 import { SeriesIdentityService } from '../../common/services/series-identity.service';
 import { SeriesMembershipService } from '../../common/services/series-membership.service';
 import { BookQueryBuilder } from './book-query-builder.service';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
+import { withDeferredBookSearchChanges } from '../../db/book-search-changes';
 import { letterJumpBucketExpr } from './jump-bucket-expr';
 import { preserveOutgoingChapters } from '../../db/preserve-audiobook-revision';
 import { DB } from '../../db';
@@ -66,6 +68,15 @@ import {
 } from '../../db/schema';
 
 type Db = NodePgDatabase<typeof schema>;
+type BookCardQueryOptions = {
+  where: SQL | undefined;
+  orderBy: SQL[];
+  limit: number;
+  offset: number;
+  userId: number;
+  nativeTitleDirection?: 'asc' | 'desc';
+  totalOverride?: number;
+};
 type DbTransaction = Parameters<Parameters<Db['transaction']>[0]>[0];
 type MetadataUpdateExecutor = Pick<Db, 'delete' | 'insert' | 'select' | 'update'>;
 type MetadataReadExecutor = Pick<Db, 'select'>;
@@ -542,6 +553,7 @@ export class BookRepository {
     @Inject(DB) private readonly db: Db,
     @Optional() private readonly seriesIdentity?: SeriesIdentityService,
     @Optional() private readonly seriesMemberships?: SeriesMembershipService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   private visibleWhere(where: SQL | undefined): SQL {
@@ -549,10 +561,51 @@ export class BookRepository {
   }
 
   async withTransaction<T>(callback: (tx: DbTransaction) => Promise<T>): Promise<T> {
-    return this.db.transaction((tx) => callback(tx));
+    return this.db.transaction((tx) => (this.searchCapture?.enabled ? withDeferredBookSearchChanges(tx, () => callback(tx)) : callback(tx)));
   }
 
-  async findCards(opts: { where: SQL | undefined; orderBy: SQL[]; limit: number; offset: number; userId: number }) {
+  async findCards(opts: BookCardQueryOptions) {
+    if (opts.nativeTitleDirection) {
+      const { nativeTitleDirection, ...rest } = opts;
+      return this.db.transaction(
+        async (tx) => {
+          const repository = new BookRepository(tx as unknown as Db, this.seriesIdentity, this.seriesMemberships, this.searchCapture);
+          const total = await repository.countWhere(opts.where);
+          const candidates = await tx
+            .select({ id: books.id })
+            .from(bookMetadata)
+            .innerJoin(books, eq(books.id, bookMetadata.bookId))
+            .innerJoin(libraries, eq(libraries.id, books.libraryId))
+            .leftJoin(userBookRatings, and(eq(userBookRatings.bookId, books.id), eq(userBookRatings.userId, opts.userId)))
+            .where(and(this.visibleWhere(opts.where), isNotNull(bookMetadata.title)))
+            .orderBy(nativeTitleDirection === 'asc' ? asc(bookMetadata.title) : desc(bookMetadata.title), asc(books.id))
+            .limit(opts.limit)
+            .offset(opts.offset);
+          // A full non-null page matches the native NULLS LAST order. Keep the
+          // original query at the boundary so missing metadata is included.
+          const complete = candidates.length === opts.limit;
+          return repository.findCardsSnapshot({
+            ...rest,
+            where: complete
+              ? and(
+                  opts.where,
+                  inArray(
+                    books.id,
+                    candidates.map((row) => row.id),
+                  ),
+                )
+              : opts.where,
+            offset: complete ? 0 : opts.offset,
+            totalOverride: total,
+          });
+        },
+        { isolationLevel: 'repeatable read', accessMode: 'read only' },
+      );
+    }
+    return this.findCardsSnapshot(opts);
+  }
+
+  private async findCardsSnapshot(opts: BookCardQueryOptions) {
     const { where, orderBy, limit, offset, userId } = opts;
     const visibleWhere = this.visibleWhere(where);
 
@@ -583,7 +636,14 @@ export class BookRepository {
         hardcoverId: bookMetadata.hardcoverId,
         hardcoverEditionId: bookMetadata.hardcoverEditionId,
         metadataScore: bookMetadata.metadataScore,
-        _total: sql<number>`count(*) over()`.as('_total'),
+        _total: (opts.totalOverride !== undefined
+          ? sql<number>`${opts.totalOverride}`
+          : sql<number>`(
+          SELECT count(*) FROM ${books}
+          LEFT JOIN ${bookMetadata} ON ${bookMetadata.bookId} = ${books.id}
+          WHERE ${visibleWhere}
+        )`
+        ).as('_total'),
       })
       .from(books)
       .innerJoin(libraries, eq(libraries.id, books.libraryId))
@@ -594,7 +654,7 @@ export class BookRepository {
       .limit(limit)
       .offset(offset);
 
-    const total = rows.length > 0 ? rows[0]._total : await this.countWhere(visibleWhere);
+    const total = opts.totalOverride ?? (rows.length > 0 ? rows[0]._total : await this.countWhere(visibleWhere));
 
     const bookRefs = rows.map((r) => ({ id: r.id, primaryFileId: r.primaryFileId ?? null }));
     const enrichment = await this.enrichBookIds(bookRefs, userId);
@@ -1947,23 +2007,29 @@ export class BookRepository {
    */
   async countFormatFacets<F extends string>(where: SQL | undefined, formats: readonly F[]): Promise<Array<{ format: F; count: number }>> {
     if (formats.length === 0) return [];
+    const requestedFormats = sql.join(
+      formats.map((format) => sql`${format}`),
+      sql`, `,
+    );
     const result = await this.db.execute<{ format: F; count: string | number }>(sql`
-      SELECT facet_key.format AS format, count(DISTINCT ${books.id}) AS count
+      SELECT facet_file.format AS format, count(*) AS count
+      FROM ${books}
+      LEFT JOIN ${bookMetadata} ON ${bookMetadata.bookId} = ${books.id}
+      INNER JOIN (
+        SELECT DISTINCT book_id, format FROM ${bookFiles}
+        WHERE format IN (${requestedFormats})
+      ) AS facet_file ON facet_file.book_id = ${books.id}
+      WHERE ${this.visibleWhere(where)}
+      GROUP BY facet_file.format
+      UNION ALL
+      SELECT ${READ_ALONG_FORMAT_PRIORITY} AS format, count(DISTINCT ${books.id}) AS count
       FROM ${books}
       LEFT JOIN ${bookMetadata} ON ${bookMetadata.bookId} = ${books.id}
       INNER JOIN ${bookFiles} AS facet_file ON facet_file.book_id = ${books.id}
-      CROSS JOIN LATERAL (
-        SELECT facet_file.format AS format
-        UNION ALL
-        SELECT ${READ_ALONG_FORMAT_PRIORITY}
-        WHERE facet_file.format = 'epub' AND facet_file.media_overlay_available = true
-      ) AS facet_key
       WHERE ${this.visibleWhere(where)}
-        AND facet_key.format IN (${sql.join(
-          formats.map((format) => sql`${format}`),
-          sql`, `,
-        )})
-      GROUP BY facet_key.format
+        AND facet_file.format = 'epub' AND facet_file.media_overlay_available = true
+        AND ${READ_ALONG_FORMAT_PRIORITY} IN (${requestedFormats})
+      HAVING count(*) > 0
     `);
     return result.rows.map((row) => ({ format: row.format, count: Number(row.count) }));
   }
@@ -2219,6 +2285,12 @@ export class BookRepository {
   }
 
   async deleteByIds(bookIds: number[]): Promise<void> {
+    if (this.searchCapture?.enabled) {
+      await this.db.transaction((tx) =>
+        deleteBooksWithHashInvalidation(tx, inArray(books.id, bookIds), { keepFinishedReads: true, captureSearch: true }),
+      );
+      return;
+    }
     await deleteBooksWithHashInvalidation(this.db, inArray(books.id, bookIds), { keepFinishedReads: true });
   }
 
@@ -2279,7 +2351,7 @@ export class BookRepository {
           books.id,
           rows.map((row) => row.id),
         ),
-        { keepFinishedReads: true },
+        { keepFinishedReads: true, captureSearch: this.searchCapture?.enabled },
       );
     });
   }
@@ -2382,8 +2454,9 @@ export class BookRepository {
     fields: Partial<typeof bookMetadata.$inferInsert>,
     executor: MetadataUpdateExecutor = this.db,
   ): Promise<void> {
-    if (executor === this.db && Object.prototype.hasOwnProperty.call(fields, 'chapters')) {
-      return this.db.transaction((tx) => this.updateMetadataFields(bookId, fields, tx));
+    const capture = this.searchCapture?.capturesMetadata(fields) ?? false;
+    if (executor === this.db && (Object.prototype.hasOwnProperty.call(fields, 'chapters') || capture)) {
+      return this.withTransaction((tx) => this.updateMetadataFields(bookId, fields, tx));
     }
     const shouldSyncSeries =
       Object.prototype.hasOwnProperty.call(fields, 'seriesName') || Object.prototype.hasOwnProperty.call(fields, 'seriesIndex');
@@ -2398,6 +2471,7 @@ export class BookRepository {
       await this.seriesMemberships?.syncPrimaryFromMetadata(bookId, executor);
     }
     await executor.update(books).set({ updatedAt: new Date() }).where(eq(books.id, bookId));
+    if (capture) await this.searchCapture!.enqueue(executor, [bookId]);
   }
 
   // Only fills a missing shared edition id - never overwrites a value already set by someone
@@ -2442,6 +2516,8 @@ export class BookRepository {
     executor: MetadataUpdateExecutor = this.db,
   ): Promise<void> {
     if (bookIds.length === 0) return;
+    const capture = this.searchCapture?.capturesMetadata(fields) ?? false;
+    if (executor === this.db && capture) return this.withTransaction((tx) => this.bulkUpdateMetadataFields(bookIds, fields, tx));
     const shouldSyncSeries =
       Object.prototype.hasOwnProperty.call(fields, 'seriesName') || Object.prototype.hasOwnProperty.call(fields, 'seriesIndex');
     const patch = (await this.seriesIdentity?.resolveMetadataPatch(fields, executor)) ?? fields;
@@ -2450,6 +2526,7 @@ export class BookRepository {
       await this.seriesMemberships?.syncPrimaryFromMetadataForBooks(bookIds, executor);
     }
     await executor.update(books).set({ updatedAt: new Date() }).where(inArray(books.id, bookIds));
+    if (capture) await this.searchCapture!.enqueue(executor, bookIds);
   }
 
   async upsertProgress(

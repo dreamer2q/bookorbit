@@ -16,9 +16,45 @@ export const appConfig = registerAs('app', () => ({
   metadataProviderDirectoryUrl: parseDirectoryUrl(process.env.METADATA_PROVIDER_DIRECTORY_URL),
   oidcAllowLocalIssuers: parseBooleanFlag(process.env.OIDC_ALLOW_LOCAL_ISSUERS, false),
   swaggerEnabled: parseBooleanFlag(process.env.SWAGGER_ENABLED, false),
+  bookSearch: {
+    enabled: parseBooleanFlag(process.env.BOOK_SEARCH_ENABLED, false),
+    indexReady: parseBooleanFlag(process.env.BOOK_SEARCH_INDEX_READY, false),
+    restartProofPath: process.env.BOOK_SEARCH_RESTART_PROOF_PATH?.trim() || undefined,
+    endpoint: process.env.BOOK_SEARCH_ENDPOINT?.trim() || 'http://127.0.0.1:4085',
+    index: process.env.BOOK_SEARCH_INDEX?.trim() || 'books_metadata_gse_v1',
+    username: process.env.BOOK_SEARCH_USERNAME || '',
+    password: process.env.BOOK_SEARCH_PASSWORD || '',
+    timeoutMs: parsePositiveInteger(process.env.BOOK_SEARCH_TIMEOUT_MS, 1500),
+    maxResultWindow: parsePositiveInteger(process.env.BOOK_SEARCH_MAX_RESULT_WINDOW, 1000),
+    matchMode: parseBookSearchMatchMode(process.env.BOOK_SEARCH_MATCH_MODE),
+    workerEnabled: parseBooleanFlag(process.env.BOOK_SEARCH_WORKER_ENABLED, false),
+    workerIntervalMs: parseBookSearchInterval(process.env.BOOK_SEARCH_WORKER_INTERVAL_MS),
+    workerBatchSize: parseBookSearchBatchSize(process.env.BOOK_SEARCH_WORKER_BATCH_SIZE),
+  },
   koboCloudscraperPython: process.env.KOBO_CLOUDSCRAPER_PYTHON?.trim() || undefined,
   koreaderPluginSourcePath: process.env.KOREADER_PLUGIN_PATH?.trim() || undefined,
 }));
+
+function parseBookSearchMatchMode(value: string | undefined): 'contains' | 'fulltext' {
+  const mode = value?.trim() || 'contains';
+  if (mode !== 'contains' && mode !== 'fulltext') throw new Error('BOOK_SEARCH_MATCH_MODE must be contains or fulltext');
+  return mode;
+}
+
+function parseBookSearchInterval(value: string | undefined): number {
+  if (!value?.trim()) return 100;
+  const interval = Number(value);
+  if (!Number.isSafeInteger(interval) || interval < 10 || interval > 60_000)
+    throw new Error('BOOK_SEARCH_WORKER_INTERVAL_MS must be an integer between10 and60000');
+  return interval;
+}
+
+function parseBookSearchBatchSize(value: string | undefined): number {
+  if (!value?.trim()) return 100;
+  const size = Number(value);
+  if (!Number.isSafeInteger(size) || size < 1 || size > 500) throw new Error('BOOK_SEARCH_WORKER_BATCH_SIZE must be an integer between1 and500');
+  return size;
+}
 
 export const dbConfig = registerAs('db', () => ({
   url: process.env.DATABASE_URL ?? 'postgres://bookorbit:bookorbit@localhost:5432/bookorbit',

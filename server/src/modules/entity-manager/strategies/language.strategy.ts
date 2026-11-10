@@ -1,8 +1,9 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { DB } from '../../../db';
 import * as schema from '../../../db/schema';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
 import { InlineEntityStrategy } from './inline-entity.strategy';
 
 type Db = NodePgDatabase<typeof schema>;
@@ -13,7 +14,7 @@ export class LanguageStrategy extends InlineEntityStrategy {
   protected readonly fieldName = 'language';
   protected readonly rawFieldName = 'language';
 
-  constructor(@Inject(DB) db: Db) {
-    super(db);
+  constructor(@Inject(DB) db: Db, @Optional() searchCapture?: BookSearchCaptureService) {
+    super(db, searchCapture);
   }
 }

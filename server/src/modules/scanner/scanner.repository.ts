@@ -1,6 +1,6 @@
 import { realignAudioTrackOrder } from '../../db/audio-track-order';
 import { recordBookFileHashHistory, deleteBookFilesWithHashInvalidation, deleteBooksWithHashInvalidation } from '../../db/book-file-hash-history';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -24,6 +24,8 @@ import {
   users,
 } from '../../db/schema';
 import { rankFileRowsByBook } from '../../common/utils/primary-file-selection.utils';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
+import { enqueueBookSearchSelection } from '../../db/book-search-changes';
 
 type Db = NodePgDatabase<typeof schema>;
 type DbTransaction = Parameters<Parameters<Db['transaction']>[0]>[0];
@@ -34,7 +36,10 @@ type MoveBookToLibraryResult = Pick<typeof books.$inferSelect, 'id' | 'libraryId
 
 @Injectable()
 export class ScannerRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   // ── Scan Jobs ──────────────────────────────────────────────────────────────
 
@@ -229,7 +234,12 @@ export class ScannerRepository {
   }
 
   async createBook(data: typeof books.$inferInsert) {
-    const rows = await this.db
+    if (this.searchCapture?.enabled) return this.db.transaction((tx) => this.createBookInExecutor(data, tx));
+    return this.createBookInExecutor(data, this.db);
+  }
+
+  private async createBookInExecutor(data: typeof books.$inferInsert, executor: Db | DbTransaction) {
+    const rows = await executor
       .insert(books)
       .values(data)
       .onConflictDoUpdate({
@@ -244,20 +254,31 @@ export class ScannerRepository {
       .returning();
     const book = rows[0]!;
     // Always create an empty metadata row so joins never return null.
-    await this.db.insert(bookMetadata).values({ bookId: book.id }).onConflictDoNothing();
+    await executor.insert(bookMetadata).values({ bookId: book.id }).onConflictDoNothing();
+    await this.searchCapture?.enqueue(executor, [book.id]);
     return book;
   }
 
   async updateBookStatus(id: number, status: 'present' | 'missing') {
+    if (this.searchCapture?.enabled) return this.updateCapturedStatuses([id], status);
     await this.db.update(books).set({ status, updatedAt: new Date() }).where(eq(books.id, id));
   }
 
   async promoteProcessingBookToPresent(bookId: number): Promise<boolean> {
-    const rows = await this.db
+    if (this.searchCapture?.enabled) return this.db.transaction((tx) => this.promoteProcessingBookInExecutor(bookId, tx));
+    return this.promoteProcessingBookInExecutor(bookId, this.db);
+  }
+
+  private async promoteProcessingBookInExecutor(bookId: number, executor: Db | DbTransaction): Promise<boolean> {
+    const rows = await executor
       .update(books)
       .set({ status: 'present', updatedAt: new Date() })
       .where(and(eq(books.id, bookId), eq(books.status, 'processing')))
       .returning({ id: books.id });
+    await this.searchCapture?.enqueue(
+      executor,
+      rows.map((row) => row.id),
+    );
     return rows.length > 0;
   }
 
@@ -275,7 +296,15 @@ export class ScannerRepository {
 
   async markBooksAsMissing(ids: number[]) {
     if (ids.length === 0) return;
+    if (this.searchCapture?.enabled) return this.updateCapturedStatuses(ids, 'missing');
     await this.db.update(books).set({ status: 'missing', updatedAt: new Date() }).where(inArray(books.id, ids));
+  }
+
+  private async updateCapturedStatuses(bookIds: number[], status: 'present' | 'missing'): Promise<void> {
+    await this.db.execute(sql`WITH changed_books AS (
+      UPDATE ${books} SET status = ${status}, updated_at = now()
+      WHERE ${inArray(books.id, bookIds)} RETURNING id AS book_id
+    ), ${enqueueBookSearchSelection(sql`SELECT book_id FROM changed_books`, sql`SELECT count(*) FROM changed_books`)}`);
   }
 
   // ── Book Files ─────────────────────────────────────────────────────────────
@@ -413,6 +442,7 @@ export class ScannerRepository {
 
   async markBooksAsPresent(bookIds: number[]) {
     if (bookIds.length === 0) return;
+    if (this.searchCapture?.enabled) return this.updateCapturedStatuses(bookIds, 'present');
     await this.db.update(books).set({ status: 'present', updatedAt: new Date() }).where(inArray(books.id, bookIds));
   }
 
@@ -456,6 +486,7 @@ export class ScannerRepository {
           status: books.status,
           primaryFileId: books.primaryFileId,
         });
+      if (book) await this.searchCapture?.enqueue(tx, [book.id]);
       return book ? { ...book, previousLibraryId: current.libraryId, libraryChanged } : null;
     });
   }
@@ -673,6 +704,7 @@ export class ScannerRepository {
         })
         .where(eq(books.id, input.sourceBookId));
 
+      await this.searchCapture?.enqueue(tx, [input.sourceBookId, input.duplicateBookId]);
       return { bookId: input.sourceBookId, libraryId: duplicate.libraryId, duplicateBookId: input.duplicateBookId };
     });
   }

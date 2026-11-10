@@ -1,4 +1,4 @@
-import { BadRequestException, Inject } from '@nestjs/common';
+import { BadRequestException, Inject, Optional } from '@nestjs/common';
 import { SQL, and, asc, count, eq, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -24,6 +24,8 @@ import type {
   EntityBookScope,
 } from './entity-strategy.interface';
 import { buildEntityBookScopeClauses } from './entity-book-scope';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
+import { withDeferredBookSearchChanges } from '../../../db/book-search-changes';
 
 type Db = NodePgDatabase<typeof schema>;
 
@@ -38,7 +40,10 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
   protected abstract readonly fieldName: string;
   protected abstract readonly rawFieldName: string;
 
-  constructor(@Inject(DB) protected readonly db: Db) {}
+  constructor(
+    @Inject(DB) protected readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   protected get field() {
     return (bookMetadata as any)[this.fieldName];
@@ -164,10 +169,11 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
       libraryIds.map((id) => sql`${id}`),
       sql`, `,
     );
-    const affectedBookIds = new Set<number>();
+    return this.withMutationExecutor(async (executor) => {
+      const affectedBookIds = new Set<number>();
 
-    for (const sourceValue of sourceValues) {
-      const affectedRows = await this.db.execute<{ bookId: number }>(sql`
+      for (const sourceValue of sourceValues) {
+        const affectedRows = await executor.execute<{ bookId: number }>(sql`
         UPDATE book_metadata bm SET ${sql.raw(this.rawFieldName)} = ${targetValue}
         FROM books b
         WHERE bm.book_id = b.id
@@ -175,10 +181,12 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
         AND bm.${sql.raw(this.rawFieldName)} = ${sourceValue}
         RETURNING bm.book_id AS "bookId"
       `);
-      for (const row of affectedRows.rows) affectedBookIds.add(row.bookId);
-    }
+        await this.captureRows(executor, affectedRows.rows);
+        for (const row of affectedRows.rows) affectedBookIds.add(row.bookId);
+      }
 
-    return { affectedBookIds: [...affectedBookIds] };
+      return { affectedBookIds: [...affectedBookIds] };
+    });
   }
 
   async rename(input: RenameInput): Promise<StrategyRenameResult> {
@@ -192,7 +200,8 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
 
     const idsLiteral = sql.raw(`(${input.libraryIds.join(',')})`);
 
-    const existingCount = await this.db.execute<{ cnt: number }>(sql`
+    return this.withMutationExecutor(async (executor) => {
+      const existingCount = await executor.execute<{ cnt: number }>(sql`
       SELECT count(DISTINCT bm.book_id)::int AS cnt
       FROM book_metadata bm
       JOIN books b ON b.id = bm.book_id
@@ -200,9 +209,9 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
       AND bm.${sql.raw(this.rawFieldName)} <> ${currentValue}
       AND ${this.buildIdentityEqualsCondition('bm', trimmed)}
     `);
-    const wasImplicitMerge = (existingCount.rows[0]?.cnt ?? 0) > 0;
+      const wasImplicitMerge = (existingCount.rows[0]?.cnt ?? 0) > 0;
 
-    const affectedRows = await this.db.execute<{ bookId: number }>(sql`
+      const affectedRows = await executor.execute<{ bookId: number }>(sql`
       UPDATE book_metadata bm SET ${sql.raw(this.rawFieldName)} = ${trimmed}
       FROM books b
       WHERE bm.book_id = b.id
@@ -211,12 +220,14 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
       RETURNING bm.book_id AS "bookId"
     `);
 
-    return {
-      oldName: currentValue,
-      affectedBookIds: affectedRows.rows.map((r) => r.bookId),
-      wasImplicitMerge,
-      mergedEntityId: wasImplicitMerge ? trimmed : undefined,
-    };
+      await this.captureRows(executor, affectedRows.rows);
+      return {
+        oldName: currentValue,
+        affectedBookIds: affectedRows.rows.map((r) => r.bookId),
+        wasImplicitMerge,
+        mergedEntityId: wasImplicitMerge ? trimmed : undefined,
+      };
+    });
   }
 
   async deleteEntity(input: DeleteInput): Promise<StrategyDeleteResult> {
@@ -225,7 +236,8 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
 
     const idsLiteral = sql.raw(`(${input.libraryIds.join(',')})`);
 
-    const affectedRows = await this.db.execute<{ bookId: number }>(sql`
+    return this.withMutationExecutor(async (executor) => {
+      const affectedRows = await executor.execute<{ bookId: number }>(sql`
       UPDATE book_metadata bm SET ${sql.raw(this.rawFieldName)} = NULL
       FROM books b
       WHERE bm.book_id = b.id
@@ -234,7 +246,24 @@ export abstract class InlineEntityStrategy implements EntityStrategy {
       RETURNING bm.book_id AS "bookId"
     `);
 
-    return { name: value, affectedBookIds: affectedRows.rows.map((r) => r.bookId) };
+      await this.captureRows(executor, affectedRows.rows);
+      return { name: value, affectedBookIds: affectedRows.rows.map((r) => r.bookId) };
+    });
+  }
+
+  private withMutationExecutor<T>(mutation: (executor: Db) => Promise<T>): Promise<T> {
+    if (!this.searchCapture?.enabled) return mutation(this.db);
+    return this.db.transaction((tx) => withDeferredBookSearchChanges(tx, () => mutation(tx as unknown as Db)));
+  }
+
+  private async captureRows(executor: Db, rows: { bookId: number }[]): Promise<void> {
+    if (!this.searchCapture?.enabled) return;
+    for (let offset = 0; offset < rows.length; offset += 1000) {
+      await this.searchCapture.enqueue(
+        executor,
+        rows.slice(offset, offset + 1000).map((row) => row.bookId),
+      );
+    }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars

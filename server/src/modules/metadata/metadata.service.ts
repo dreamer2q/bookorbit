@@ -23,6 +23,7 @@ import { boundProviderId } from '../../common/utils/provider-id.utils';
 import { SeriesIdentityService } from '../../common/services/series-identity.service';
 import { SeriesExpectedCountService } from '../../common/services/series-expected-count.service';
 import { SeriesMembershipService } from '../../common/services/series-membership.service';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 import { refreshPrimaryAuthorSortNamesForAuthors, refreshPrimaryAuthorSortNamesForBooks } from '../../db/book-author-sort-key';
 import { AudiobookChaptersService } from '../audiobook-chapters/audiobook-chapters.service';
 import { BookEmbedderService } from '../embedding/book-embedder.service';
@@ -109,6 +110,7 @@ export class MetadataService {
     @Optional() private readonly seriesIdentity?: SeriesIdentityService,
     @Optional() private readonly seriesMemberships?: SeriesMembershipService,
     @Optional() private readonly seriesExpectedCount?: SeriesExpectedCountService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   // ── Public API ───────────────────────────────────────────────────────────────
@@ -252,11 +254,7 @@ export class MetadataService {
     if (Object.keys(scalarFields).length === 0 && !writesAuthors) return 'unchanged';
 
     if (Object.keys(scalarFields).length > 0) {
-      scalarFields.updatedAt = new Date();
-      const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields)) ?? scalarFields;
-      await this.db.update(bookMetadata).set(patch).where(eq(bookMetadata.bookId, bookId));
-      if (scalarFields.seriesName !== undefined || scalarFields.seriesIndex !== undefined)
-        await this.seriesMemberships?.syncPrimaryFromMetadata(bookId);
+      await this.persistScalarFields(bookId, scalarFields);
     }
     if (writesAuthors) {
       await this.replaceAuthors(
@@ -805,11 +803,12 @@ export class MetadataService {
 
     if (uniqueAuthors.length === 0) {
       await refreshPrimaryAuthorSortNamesForBooks(executor, [bookId]);
+      await this.searchCapture?.enqueue(executor, [bookId]);
       return [];
     }
 
     const authorByNameKey = new Map<string, { id: number }>();
-    await this.addExistingAuthorsByNormalizedName(
+    const canonicalizedAuthorIds = await this.addExistingAuthorsByNormalizedName(
       executor,
       authorByNameKey,
       uniqueAuthors.map((author) => author.name),
@@ -832,10 +831,12 @@ export class MetadataService {
       }
     }
 
-    await this.addExistingAuthorsByNormalizedName(
-      executor,
-      authorByNameKey,
-      uniqueAuthors.filter((author) => !authorByNameKey.has(normalizeMetadataTextKey(author.name) ?? '')).map((author) => author.name),
+    canonicalizedAuthorIds.push(
+      ...(await this.addExistingAuthorsByNormalizedName(
+        executor,
+        authorByNameKey,
+        uniqueAuthors.filter((author) => !authorByNameKey.has(normalizeMetadataTextKey(author.name) ?? '')).map((author) => author.name),
+      )),
     );
 
     const links = uniqueAuthors.flatMap((author, index) => {
@@ -851,6 +852,9 @@ export class MetadataService {
 
     await refreshPrimaryAuthorSortNamesForBooks(executor, [bookId]);
 
+    await this.searchCapture?.enqueueAuthors(executor, canonicalizedAuthorIds);
+    await this.searchCapture?.enqueue(executor, [bookId]);
+
     return links.map((link) => link.authorId);
   }
 
@@ -858,11 +862,11 @@ export class MetadataService {
     executor: RelationMutationExecutor,
     authorByNameKey: Map<string, { id: number }>,
     names: string[],
-  ): Promise<void> {
+  ): Promise<number[]> {
     const keys = [...new Set(names.map((name) => normalizeMetadataTextKey(name)).filter((key): key is string => key !== null))].filter(
       (key) => !authorByNameKey.has(key),
     );
-    if (keys.length === 0) return;
+    if (keys.length === 0) return [];
 
     const existingAuthors = await executor
       .select({ id: authors.id, name: authors.name, normalizedName: NORMALIZED_AUTHOR_NAME_SQL })
@@ -895,6 +899,7 @@ export class MetadataService {
 
       const canonicalName = normalizeMetadataText(match.name);
       if (canonicalName && match.name !== canonicalName && !rows.some((row) => row.id !== match.id && row.name === canonicalName)) {
+        if (this.searchCapture?.enabled) await executor.select({ id: authors.id }).from(authors).where(eq(authors.id, match.id)).for('update');
         await executor.update(authors).set({ name: canonicalName }).where(eq(authors.id, match.id));
         canonicalizedAuthorIds.push(match.id);
       }
@@ -904,6 +909,7 @@ export class MetadataService {
     if (canonicalizedAuthorIds.length > 0) {
       await refreshPrimaryAuthorSortNamesForAuthors(executor, canonicalizedAuthorIds);
     }
+    return canonicalizedAuthorIds;
   }
 
   private async replaceGenresInExecutor(executor: RelationMutationExecutor, bookId: number, uniqueGenres: string[]): Promise<void> {
@@ -987,6 +993,21 @@ export class MetadataService {
     });
   }
 
+  private async persistScalarFields(bookId: number, fields: Partial<typeof bookMetadata.$inferInsert>): Promise<void> {
+    const capture = this.searchCapture?.capturesMetadata(fields) ?? false;
+    const persist = async (executor: RelationMutationExecutor) => {
+      const shouldSyncSeries =
+        Object.prototype.hasOwnProperty.call(fields, 'seriesName') || Object.prototype.hasOwnProperty.call(fields, 'seriesIndex');
+      fields.updatedAt = new Date();
+      const patch = (await this.seriesIdentity?.resolveMetadataPatch(fields, executor)) ?? fields;
+      await executor.update(bookMetadata).set(patch).where(eq(bookMetadata.bookId, bookId));
+      if (shouldSyncSeries) await this.seriesMemberships?.syncPrimaryFromMetadata(bookId, executor);
+      if (capture) await this.searchCapture!.enqueue(executor, [bookId]);
+    };
+    if (capture) await this.db.transaction(persist);
+    else await persist(this.db);
+  }
+
   private async persistAudioMetadata(bookId: number, data: ParsedBookData, preserveAbsentRelations = false): Promise<void> {
     const { dto: filtered } = await this.bookMetadataLockService.filterAutomatedBookUpdate(bookId, {
       title: data.title,
@@ -1032,14 +1053,7 @@ export class MetadataService {
     if (filtered.librofmId !== undefined) scalarFields.librofmId = filtered.librofmId;
     if (filtered.audioMetadata?.durationSeconds !== undefined) scalarFields.durationSeconds = filtered.audioMetadata.durationSeconds;
     if (Object.keys(scalarFields).length > 0) {
-      const shouldSyncSeries =
-        Object.prototype.hasOwnProperty.call(scalarFields, 'seriesName') || Object.prototype.hasOwnProperty.call(scalarFields, 'seriesIndex');
-      scalarFields.updatedAt = new Date();
-      const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields)) ?? scalarFields;
-      await this.db.update(bookMetadata).set(patch).where(eq(bookMetadata.bookId, bookId));
-      if (shouldSyncSeries) {
-        await this.seriesMemberships?.syncPrimaryFromMetadata(bookId);
-      }
+      await this.persistScalarFields(bookId, scalarFields);
     }
 
     if (filtered.authors !== undefined) {
@@ -1135,14 +1149,7 @@ export class MetadataService {
     if (filtered.aladinId !== undefined) scalarFields.aladinId = filtered.aladinId;
     if (filtered.itunesId !== undefined) scalarFields.itunesId = filtered.itunesId;
     if (Object.keys(scalarFields).length > 0) {
-      const shouldSyncSeries =
-        Object.prototype.hasOwnProperty.call(scalarFields, 'seriesName') || Object.prototype.hasOwnProperty.call(scalarFields, 'seriesIndex');
-      scalarFields.updatedAt = new Date();
-      const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields)) ?? scalarFields;
-      await this.db.update(bookMetadata).set(patch).where(eq(bookMetadata.bookId, bookId));
-      if (shouldSyncSeries) {
-        await this.seriesMemberships?.syncPrimaryFromMetadata(bookId);
-      }
+      await this.persistScalarFields(bookId, scalarFields);
     }
 
     if (filtered.authors !== undefined) {

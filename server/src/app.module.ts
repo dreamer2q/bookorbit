@@ -25,6 +25,7 @@ import {
 import { validateEnv } from './config/env.validation';
 import { loggerConfig } from './common/logger.config';
 import { CommonModule } from './common/common.module';
+import { BookSearchCaptureModule } from './common/book-search-capture.module';
 import { SeriesIdentityModule } from './common/series-identity.module';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { GLOBAL_GUARDS } from './common/guards/global-guards';
@@ -142,6 +143,7 @@ import { ReadAloudModule } from './modules/read-aloud/read-aloud.module';
     DbModule,
     SeriesIdentityModule,
     CommonModule,
+    BookSearchCaptureModule,
     SeedModule,
     AuthModule,
     AppSettingsModule,

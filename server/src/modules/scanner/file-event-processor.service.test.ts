@@ -426,6 +426,14 @@ describe('handleCreate — file', () => {
     await expect(makeService().handleCreate('/books/Author/Book/metadata.opf')).resolves.toEqual({ type: 'noop' });
   });
 
+  it.each(['opf', 'nfo'])('rescans a known book folder when its %s sidecar is published', async (format) => {
+    mockStat.mockResolvedValue(makeFileStat());
+    mockRepo.findBooksByFolderPath.mockResolvedValue([{ id: 4, folderPath: '/books/Author/Book', status: 'present' }] as any);
+
+    await expect(makeService().handleCreate('/books/Author/Book/metadata.' + format, 7)).resolves.toEqual({ type: 'scan-required', scope: 'file' });
+    expect(mockRepo.findBooksByFolderPath).toHaveBeenCalledWith('/books/Author/Book', 7);
+  });
+
   it('rescans a book folder when a folder image appears or changes in it', async () => {
     mockStat.mockResolvedValue(makeFileStat());
     mockRepo.findBooksByFolderPath.mockResolvedValue([

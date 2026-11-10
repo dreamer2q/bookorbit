@@ -22,6 +22,22 @@ function resetEnv(): void {
   delete process.env.APP_VERSION;
   delete process.env.OIDC_ALLOW_LOCAL_ISSUERS;
   delete process.env.SWAGGER_ENABLED;
+  for (const key of [
+    'BOOK_SEARCH_ENABLED',
+    'BOOK_SEARCH_INDEX_READY',
+    'BOOK_SEARCH_RESTART_PROOF_PATH',
+    'BOOK_SEARCH_ENDPOINT',
+    'BOOK_SEARCH_INDEX',
+    'BOOK_SEARCH_USERNAME',
+    'BOOK_SEARCH_PASSWORD',
+    'BOOK_SEARCH_TIMEOUT_MS',
+    'BOOK_SEARCH_MAX_RESULT_WINDOW',
+    'BOOK_SEARCH_MATCH_MODE',
+    'BOOK_SEARCH_WORKER_ENABLED',
+    'BOOK_SEARCH_WORKER_INTERVAL_MS',
+    'BOOK_SEARCH_WORKER_BATCH_SIZE',
+  ])
+    delete process.env[key];
   delete process.env.KOBO_CLOUDSCRAPER_PYTHON;
   delete process.env.KOREADER_PLUGIN_PATH;
   delete process.env.METADATA_PROVIDER_DIRECTORY_URL;
@@ -73,9 +89,63 @@ describe('config', () => {
       metadataProviderDirectoryUrl: 'https://raw.githubusercontent.com/bookorbit/bookorbit-metadata-providers/main/directory.json',
       oidcAllowLocalIssuers: false,
       swaggerEnabled: false,
+      bookSearch: {
+        enabled: false,
+        indexReady: false,
+        restartProofPath: undefined,
+        endpoint: 'http://127.0.0.1:4085',
+        index: 'books_metadata_gse_v1',
+        username: '',
+        password: '',
+        timeoutMs: 1500,
+        maxResultWindow: 1000,
+        matchMode: 'contains',
+        workerEnabled: false,
+        workerIntervalMs: 100,
+        workerBatchSize: 100,
+      },
       koboCloudscraperPython: undefined,
       koreaderPluginSourcePath: undefined,
     });
+  });
+
+  it('selects explicit fulltext matching and defaults to native contains behavior', () => {
+    expect(appConfig().bookSearch.matchMode).toBe('contains');
+    process.env.BOOK_SEARCH_MATCH_MODE = ' fulltext ';
+    expect(appConfig().bookSearch.matchMode).toBe('fulltext');
+  });
+
+  it('requires an explicit restart proof path and trims an empty setting back to ordinary reconciliation', () => {
+    expect(appConfig().bookSearch.restartProofPath).toBeUndefined();
+    process.env.BOOK_SEARCH_RESTART_PROOF_PATH = ' /private/search-restart.json ';
+    expect(appConfig().bookSearch.restartProofPath).toBe('/private/search-restart.json');
+    process.env.BOOK_SEARCH_RESTART_PROOF_PATH = ' ';
+    expect(appConfig().bookSearch.restartProofPath).toBeUndefined();
+  });
+
+  it('keeps the worker opt-in and bounds the interval', () => {
+    process.env.BOOK_SEARCH_WORKER_ENABLED = 'true';
+    process.env.BOOK_SEARCH_WORKER_INTERVAL_MS = '250';
+    expect(appConfig().bookSearch).toMatchObject({ workerEnabled: true, workerIntervalMs: 250 });
+    for (const value of ['0', '9', '60001', '1.5', 'NaN']) {
+      process.env.BOOK_SEARCH_WORKER_INTERVAL_MS = value;
+      expect(() => appConfig()).toThrow('BOOK_SEARCH_WORKER_INTERVAL_MS');
+    }
+  });
+
+  it('bounds optional index batches while retaining the existing default', () => {
+    expect(appConfig().bookSearch.workerBatchSize).toBe(100);
+    process.env.BOOK_SEARCH_WORKER_BATCH_SIZE = '500';
+    expect(appConfig().bookSearch.workerBatchSize).toBe(500);
+    for (const value of ['0', '501', 'NaN', '1.5']) {
+      process.env.BOOK_SEARCH_WORKER_BATCH_SIZE = value;
+      expect(() => appConfig()).toThrow('BOOK_SEARCH_WORKER_BATCH_SIZE');
+    }
+  });
+
+  it('rejects an unknown search mode rather than silently changing matching behavior', () => {
+    process.env.BOOK_SEARCH_MATCH_MODE = 'unsupported';
+    expect(() => appConfig()).toThrow('BOOK_SEARCH_MATCH_MODE');
   });
 
   it('reads app values from environment when provided', () => {
@@ -91,6 +161,14 @@ describe('config', () => {
     process.env.GITHUB_RELEASES_TOKEN = 'ghp_example';
     process.env.NATIVE_REDIRECT_URI = 'myfork://oauth2-callback';
     process.env.METADATA_PROVIDER_DIRECTORY_URL = ' OFF ';
+    process.env.BOOK_SEARCH_ENABLED = 'true';
+    process.env.BOOK_SEARCH_INDEX_READY = 'true';
+    process.env.BOOK_SEARCH_ENDPOINT = ' http://search:4080 ';
+    process.env.BOOK_SEARCH_INDEX = ' library_v2 ';
+    process.env.BOOK_SEARCH_USERNAME = 'fixture-user';
+    process.env.BOOK_SEARCH_PASSWORD = 'fixture-password';
+    process.env.BOOK_SEARCH_TIMEOUT_MS = '900';
+    process.env.BOOK_SEARCH_MAX_RESULT_WINDOW = '2000';
 
     expect(appConfig()).toEqual({
       nodeEnv: 'production',
@@ -103,6 +181,20 @@ describe('config', () => {
       metadataProviderDirectoryUrl: null,
       oidcAllowLocalIssuers: true,
       swaggerEnabled: true,
+      bookSearch: {
+        enabled: true,
+        indexReady: true,
+        endpoint: 'http://search:4080',
+        index: 'library_v2',
+        username: 'fixture-user',
+        password: 'fixture-password',
+        timeoutMs: 900,
+        maxResultWindow: 2000,
+        matchMode: 'contains',
+        workerEnabled: false,
+        workerIntervalMs: 100,
+        workerBatchSize: 100,
+      },
       koboCloudscraperPython: '/opt/bookorbit-python/bin/python',
       koreaderPluginSourcePath: '/opt/koreader/bookorbit.koplugin',
     });

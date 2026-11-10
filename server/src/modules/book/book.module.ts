@@ -33,6 +33,17 @@ import { BookAuthorSortKeyBackfillService } from './book-author-sort-key-backfil
 import { ReadingAttemptController } from './reading-attempt.controller';
 import { ReadingProgressController } from './reading-progress.controller';
 import { ReadingProgressService } from './reading-progress.service';
+import { BookIndexSearchService } from './search/book-index-search.service';
+import { BookSearchProvider } from './search/book-search-provider';
+import { ZincBookSearchProvider } from './search/zinc-book-search-provider';
+import { BookSearchSyncRepository } from './search/book-search-sync.repository';
+import { BookSearchSyncService } from './search/book-search-sync.service';
+import { BookSearchDocumentProjector } from './search/book-search-document-projector';
+import { ZincBookIndexWriter } from './search/zinc-book-index-writer';
+import { BookSearchBootstrapRepository } from './search/book-search-bootstrap.repository';
+import { BookSearchCoordinatorService } from './search/book-search-coordinator.service';
+import { ZincBookIndexGeneration } from './search/zinc-book-index-generation';
+import { BookSearchLifecycleService } from './search/book-search-lifecycle.service';
 
 @Module({
   imports: [
@@ -56,6 +67,16 @@ import { ReadingProgressService } from './reading-progress.service';
   ],
   controllers: [BookController, ReadingAttemptController, ReadingProgressController],
   providers: [
+    BookIndexSearchService,
+    BookSearchSyncRepository,
+    BookSearchBootstrapRepository,
+    BookSearchCoordinatorService,
+    ZincBookIndexGeneration,
+    BookSearchLifecycleService,
+    BookSearchSyncService,
+    BookSearchDocumentProjector,
+    ZincBookIndexWriter,
+    { provide: BookSearchProvider, useClass: ZincBookSearchProvider },
     BookService,
     BookRepository,
     BookReadService,

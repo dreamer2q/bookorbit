@@ -1,10 +1,12 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { eq, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { DB } from '../../db';
 import * as schema from '../../db/schema';
 import { bookMetadata, bookSeries, bookSeriesMemberships } from '../../db/schema';
+import { enqueueBookSearchSelection } from '../../db/book-search-changes';
+import { BookSearchCaptureService } from './book-search-capture.service';
 import { sanitizeLogValue } from '../utils/log-sanitize.utils';
 import {
   normalizeMetadataText,
@@ -20,7 +22,10 @@ type SeriesWriteExecutor = Pick<Db, 'insert'>;
 export class SeriesIdentityService implements OnModuleInit {
   private readonly logger = new Logger(SeriesIdentityService.name);
 
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     const start = Date.now();
@@ -116,7 +121,7 @@ export class SeriesIdentityService implements OnModuleInit {
   }
 
   async backfillMissingSeriesMemberships(executor: Pick<Db, 'execute'> = this.db): Promise<void> {
-    await executor.execute(sql`
+    const insert = sql`
       INSERT INTO ${bookSeriesMemberships} (book_id, series_id, series_index, display_order)
       SELECT ${bookMetadata.bookId}, ${bookMetadata.seriesId}, ${bookMetadata.seriesIndex}, 0
       FROM ${bookMetadata}
@@ -127,7 +132,14 @@ export class SeriesIdentityService implements OnModuleInit {
           WHERE ${bookSeriesMemberships.bookId} = ${bookMetadata.bookId}
         )
       ON CONFLICT DO NOTHING
-    `);
+    `;
+    if (!this.searchCapture?.enabled) {
+      await executor.execute(insert);
+      return;
+    }
+    // Keep the changed IDs in PostgreSQL and finish the source insert before locking the revision.
+    await executor.execute(sql`WITH inserted_memberships AS (${insert} RETURNING book_id),
+      ${enqueueBookSearchSelection(sql`SELECT book_id FROM inserted_memberships`, sql`SELECT count(*) FROM inserted_memberships`)}`);
   }
 
   async findIdByName(name: string, executor: Pick<Db, 'select'> = this.db): Promise<number | null> {

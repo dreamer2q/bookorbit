@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1793881572172,
+      "tag": "0000_search_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793899051877,
+      "tag": "0001_search_baseline",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793899217828,
+      "tag": "0002_baseline_estimate",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793900512370,
+      "tag": "0003_engine_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793903252267,
+      "tag": "0004_reconciliation_session",
+      "breakpoints": true
+    }
+  ]
+}

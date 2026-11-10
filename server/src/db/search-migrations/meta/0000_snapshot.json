@@ -1,0 +1,144 @@
+{
+  "id": "58916d4a-1ea5-4f4c-a2df-e80055b5232a",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "book_search.pending": {
+      "name": "pending",
+      "schema": "book_search",
+      "columns": {
+        "book_id": {
+          "name": "book_id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "queued_at": {
+          "name": "queued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "pending_revision_book_idx": {
+          "name": "pending_revision_book_idx",
+          "columns": [
+            {
+              "expression": "revision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "book_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "pending_positive_ids": {
+          "name": "pending_positive_ids",
+          "value": "\"book_search\".\"pending\".\"book_id\" > 0 AND \"book_search\".\"pending\".\"revision\" > 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "book_search.state": {
+      "name": "state",
+      "schema": "book_search",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "applied_revision": {
+          "name": "applied_revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "snapshot_complete": {
+          "name": "snapshot_complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "write_coverage_complete": {
+          "name": "write_coverage_complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "state_singleton": {
+          "name": "state_singleton",
+          "value": "\"book_search\".\"state\".\"id\" = 1"
+        },
+        "state_revisions": {
+          "name": "state_revisions",
+          "value": "\"book_search\".\"state\".\"applied_revision\" >= 0 AND \"book_search\".\"state\".\"applied_revision\" <= \"book_search\".\"state\".\"revision\""
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {
+    "book_search": "book_search"
+  },
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

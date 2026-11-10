@@ -2,6 +2,7 @@ import { sql, type SQL } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { dropReads, retainFinishedReads } from './reading-attempt-retention';
 import * as schema from './schema';
+import { enqueueBookSearchSelection } from './book-search-changes';
 
 export async function recordBookFileHashHistory(
   db: Pick<NodePgDatabase<typeof schema>, 'execute'>,
@@ -54,9 +55,18 @@ export async function deleteBookFilesWithHashInvalidation(db: Pick<NodePgDatabas
 export async function deleteBooksWithHashInvalidation(
   db: Pick<NodePgDatabase<typeof schema>, 'execute'>,
   filter: SQL,
-  options: { keepFinishedReads?: boolean } = {},
+  options: { keepFinishedReads?: boolean; captureSearch?: boolean } = {},
 ): Promise<void> {
   await (options.keepFinishedReads ? retainFinishedReads(db, filter) : dropReads(db, filter));
+  if (options.captureSearch) {
+    await db.execute(sql`WITH deleted_books AS (
+      DELETE FROM ${schema.books} WHERE ${filter} RETURNING id AS book_id, library_id
+    ), invalidated AS (
+      UPDATE ${schema.libraries} SET koreader_hash_revision = koreader_hash_revision + 1
+      WHERE id IN (SELECT library_id FROM deleted_books) RETURNING id
+    ), ${enqueueBookSearchSelection(sql`SELECT book_id FROM deleted_books`, sql`SELECT count(*) FROM invalidated`)}`);
+    return;
+  }
   await db.execute(sql`
     with deleted as (
       delete from ${schema.books} where ${filter} returning library_id
@@ -67,12 +77,28 @@ export async function deleteBooksWithHashInvalidation(
   `);
 }
 
-export async function deleteLibraryFoldersWithHashInvalidation(db: Pick<NodePgDatabase<typeof schema>, 'execute'>, filter: SQL): Promise<void> {
+export async function deleteLibraryFoldersWithHashInvalidation(
+  db: Pick<NodePgDatabase<typeof schema>, 'execute'>,
+  filter: SQL,
+  options: { captureSearch?: boolean } = {},
+): Promise<void> {
   // The folder's books go with it by cascade; their finished reads stay in history.
   await retainFinishedReads(
     db,
     sql`${schema.books.libraryFolderId} in (select ${schema.libraryFolders.id} from ${schema.libraryFolders} where ${filter})`,
   );
+  if (options.captureSearch) {
+    await db.execute(sql`WITH source_books AS MATERIALIZED (
+      SELECT id AS book_id FROM ${schema.books}
+      WHERE library_folder_id IN (SELECT id FROM ${schema.libraryFolders} WHERE ${filter})
+    ), deleted_folders AS (
+      DELETE FROM ${schema.libraryFolders} WHERE ${filter} AND (SELECT count(*) FROM source_books) >= 0 RETURNING library_id
+    ), invalidated AS (
+      UPDATE ${schema.libraries} SET koreader_hash_revision = koreader_hash_revision + 1
+      WHERE id IN (SELECT library_id FROM deleted_folders) RETURNING id
+    ), ${enqueueBookSearchSelection(sql`SELECT book_id FROM source_books`, sql`SELECT count(*) FROM invalidated`)}`);
+    return;
+  }
   await db.execute(sql`
     with deleted as (
       delete from ${schema.libraryFolders} where ${filter} returning library_id

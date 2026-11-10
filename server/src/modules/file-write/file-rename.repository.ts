@@ -1,5 +1,6 @@
 import { deleteBooksWithHashInvalidation } from '../../db/book-file-hash-history';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
@@ -57,7 +58,10 @@ const FOLDER_OWNER_BATCH_SIZE = 500;
 
 @Injectable()
 export class FileRenameRepository {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
+  ) {}
 
   async findBookRenameData(bookId: number): Promise<BookRenameData | null> {
     const [row] = await this.db
@@ -255,6 +259,7 @@ export class FileRenameRepository {
           updatedAt: now,
         })
         .where(eq(books.id, input.targetBookId));
+      await this.searchCapture?.enqueue(tx, [input.sourceBookId, input.targetBookId]);
     });
   }
 

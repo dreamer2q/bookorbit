@@ -1,10 +1,11 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { SQL, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { normalizeMetadataText, normalizeMetadataTextKey, normalizeMetadataTextKeySql } from '../../../common/utils/metadata-text-normalize.utils';
 import { DB } from '../../../db';
 import * as schema from '../../../db/schema';
+import { BookSearchCaptureService } from '../../../common/services/book-search-capture.service';
 import { InlineEntityStrategy } from './inline-entity.strategy';
 
 type Db = NodePgDatabase<typeof schema>;
@@ -15,8 +16,8 @@ export class PublisherStrategy extends InlineEntityStrategy {
   protected readonly fieldName = 'publisher';
   protected readonly rawFieldName = 'publisher';
 
-  constructor(@Inject(DB) db: Db) {
-    super(db);
+  constructor(@Inject(DB) db: Db, @Optional() searchCapture?: BookSearchCaptureService) {
+    super(db, searchCapture);
   }
 
   protected override normalizeInputValue(value: string): string | null {

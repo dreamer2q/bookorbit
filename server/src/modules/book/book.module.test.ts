@@ -30,6 +30,18 @@ import { DeliveryHashRegistrationService } from './delivery-hash-registration.se
 import { DeliverySelectionService } from './delivery-selection.service';
 import { AudiolessEpubService } from './audioless-epub.service';
 
+import { BookIndexSearchService } from './search/book-index-search.service';
+import { BookSearchProvider } from './search/book-search-provider';
+import { ZincBookSearchProvider } from './search/zinc-book-search-provider';
+import { BookSearchSyncRepository } from './search/book-search-sync.repository';
+import { BookSearchSyncService } from './search/book-search-sync.service';
+import { BookSearchDocumentProjector } from './search/book-search-document-projector';
+import { ZincBookIndexWriter } from './search/zinc-book-index-writer';
+import { BookSearchBootstrapRepository } from './search/book-search-bootstrap.repository';
+import { BookSearchCoordinatorService } from './search/book-search-coordinator.service';
+import { ZincBookIndexGeneration } from './search/zinc-book-index-generation';
+import { BookSearchLifecycleService } from './search/book-search-lifecycle.service';
+
 describe('BookModule', () => {
   it('imports the shared registry used by the file watcher', () => {
     expect(Reflect.getMetadata(MODULE_METADATA.IMPORTS, BookModule)).toContain(SelfWriteRegistryModule);
@@ -38,6 +50,16 @@ describe('BookModule', () => {
   it('registers expected controller/providers/exports', () => {
     expect(Reflect.getMetadata('controllers', BookModule)).toEqual([BookController, ReadingAttemptController, ReadingProgressController]);
     expect(Reflect.getMetadata('providers', BookModule)).toEqual([
+      BookIndexSearchService,
+      BookSearchSyncRepository,
+      BookSearchBootstrapRepository,
+      BookSearchCoordinatorService,
+      ZincBookIndexGeneration,
+      BookSearchLifecycleService,
+      BookSearchSyncService,
+      BookSearchDocumentProjector,
+      ZincBookIndexWriter,
+      { provide: BookSearchProvider, useClass: ZincBookSearchProvider },
       BookService,
       BookRepository,
       BookReadService,

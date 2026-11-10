@@ -1,0 +1,5 @@
+ALTER TABLE "book_search"."baseline" DROP CONSTRAINT "baseline_range";--> statement-breakpoint
+ALTER TABLE "book_search"."baseline" ADD COLUMN "orphan_cursor_book_id" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "book_search"."baseline" ADD COLUMN "pruning_complete" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "book_search"."state" ADD COLUMN "capture_session" uuid;--> statement-breakpoint
+ALTER TABLE "book_search"."baseline" ADD CONSTRAINT "baseline_range" CHECK ("book_search"."baseline"."cursor_book_id" >= 0 AND "book_search"."baseline"."cursor_book_id" <= "book_search"."baseline"."upper_book_id" AND "book_search"."baseline"."seeded_count" >= 0 AND "book_search"."baseline"."seed_revision" > 0 AND "book_search"."baseline"."orphan_cursor_book_id" >= 0);

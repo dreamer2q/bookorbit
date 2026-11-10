@@ -123,7 +123,7 @@ export class FileEventProcessorService {
     if (fileStat.isDirectory()) return this.handleCreateDir(absolutePath, scopeLibraryId);
 
     const { role, format } = classifyFile(absolutePath);
-    if (role === 'cover') return this.handleFolderImageChange(absolutePath, scopeLibraryId);
+    if (role === 'cover' || role === 'metadata') return this.handleFolderSidecarChange(absolutePath, scopeLibraryId);
     if (role !== 'content') return { type: 'noop' };
 
     const existing = await this.scannerRepo.findBookFileByAbsolutePath(absolutePath, scopeLibraryId);
@@ -230,10 +230,10 @@ export class FileEventProcessorService {
   }
 
   /**
-   * A folder image can fill an empty cover slot or replace one that came from a folder image, so a
-   * new or edited one inside a known book folder is registered by rescanning that folder.
+   * Folder sidecars can change metadata or cover slots without changing a content file.
+   * Rescan only a known book folder so an author/grouping directory does not trigger a full scan.
    */
-  private async handleFolderImageChange(absolutePath: string, scopeLibraryId?: number): Promise<FileEventResult> {
+  private async handleFolderSidecarChange(absolutePath: string, scopeLibraryId?: number): Promise<FileEventResult> {
     const folderPath = dirname(absolutePath);
     const books = await this.scannerRepo.findBooksByFolderPath(folderPath, scopeLibraryId);
     return books.some((book) => book.folderPath === folderPath && book.status !== 'missing')

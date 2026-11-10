@@ -23,6 +23,7 @@ import { ScannerService } from '../scanner/scanner.service';
 import { METADATA_AUDIO_FORMATS } from '../metadata/metadata-extraction.service';
 import { computeFileHash } from '../scanner/lib/hash';
 import { inspectEpubMediaOverlayFields } from '../reader/epub/epub-media-overlay-capability';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 
 type Db = NodePgDatabase<typeof schema>;
 type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
@@ -106,6 +107,7 @@ export class UploadProcessorService {
     @Optional() private readonly autoFetchOrchestrator?: BookMetadataFetchOrchestratorService,
     @Optional() private readonly coverReconciler?: CoverSlotReconciler,
     @Optional() private readonly scanner?: ScannerService,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {}
 
   /** A file joined or left these books, so their cover slots are brought back in line with it. */
@@ -158,6 +160,7 @@ export class UploadProcessorService {
       if (uploadSessionId) {
         await tx.update(uploadSessions).set({ resultBookId: upserted.bookId, updatedAt: new Date() }).where(eq(uploadSessions.id, uploadSessionId));
       }
+      await this.searchCapture?.enqueue(tx, [upserted.bookId]);
       return upserted;
     });
     return { bookId: result.bookId, created: result.createdBook };
@@ -212,6 +215,7 @@ export class UploadProcessorService {
         if (replaced) replacedPrimaries.push(replaced);
       }
 
+      await this.searchCapture?.enqueue(tx, bookIds);
       return { bookIds, createdBookIds, attachedFileIds, replacedPrimaries };
     });
   }
@@ -235,6 +239,7 @@ export class UploadProcessorService {
         await deleteBookFilesWithHashInvalidation(tx, inArray(bookFiles.bookId, records.createdBookIds));
         await deleteBooksWithHashInvalidation(tx, inArray(books.id, records.createdBookIds));
       }
+      await this.searchCapture?.enqueue(tx, records.bookIds);
     });
     // Metadata may already have written covers for the books this unit created.
     await Promise.allSettled(records.createdBookIds.map((bookId) => this.coverStore.removeCoverDirectory(bookId)));

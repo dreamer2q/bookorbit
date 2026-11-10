@@ -48,6 +48,7 @@ import { BookReadService } from '../book/book-read.service';
 import { NotificationService } from '../notification/notification.service';
 import { SeriesIdentityService } from '../../common/services/series-identity.service';
 import { SeriesMembershipService } from '../../common/services/series-membership.service';
+import { BookSearchCaptureService } from '../../common/services/book-search-capture.service';
 import { chapterProvenance, normalizeAudiobookChapters } from '../../common/utils/audiobook-chapters.utils';
 import { sanitizeLogValue } from '../../common/utils/log-sanitize.utils';
 import { resolveExistingPathSpelling } from '../../common/utils/path-identity.utils';
@@ -259,6 +260,7 @@ export class BookDockFinalizeService implements OnModuleInit, OnApplicationBoots
     @Optional() private readonly seriesIdentity?: SeriesIdentityService,
     @Optional() private readonly seriesMemberships?: SeriesMembershipService,
     @Optional() private readonly providerIdStore?: ProviderIdStore,
+    @Optional() private readonly searchCapture?: BookSearchCaptureService,
   ) {
     this.autoFinalizeQueue = new BookDockWorkQueue(
       AUTO_FINALIZE_QUEUE_CONCURRENCY,
@@ -1401,16 +1403,31 @@ export class BookDockFinalizeService implements OnModuleInit, OnApplicationBoots
       aladinId: meta.aladinId,
       updatedAt: new Date(),
     };
-    const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields)) ?? scalarFields;
-
-    await this.db
-      .update(bookMetadata)
-      .set({ ...patch, ...buildAudioMetadataPatch(audio) })
-      .where(eq(bookMetadata.bookId, bookId));
-    if (meta.seriesMemberships !== undefined) {
-      await this.seriesMemberships?.replaceForBook(bookId, meta.seriesMemberships);
+    if (this.searchCapture?.enabled) {
+      await this.db.transaction(async (tx) => {
+        const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields, tx)) ?? scalarFields;
+        await tx
+          .update(bookMetadata)
+          .set({ ...patch, ...buildAudioMetadataPatch(audio) })
+          .where(eq(bookMetadata.bookId, bookId));
+        if (meta.seriesMemberships !== undefined) {
+          await this.seriesMemberships?.replaceForBook(bookId, meta.seriesMemberships, tx);
+        } else {
+          await this.seriesMemberships?.syncPrimaryFromMetadata(bookId, tx);
+        }
+        await this.searchCapture!.enqueue(tx, [bookId]);
+      });
     } else {
-      await this.seriesMemberships?.syncPrimaryFromMetadata(bookId);
+      const patch = (await this.seriesIdentity?.resolveMetadataPatch(scalarFields)) ?? scalarFields;
+      await this.db
+        .update(bookMetadata)
+        .set({ ...patch, ...buildAudioMetadataPatch(audio) })
+        .where(eq(bookMetadata.bookId, bookId));
+      if (meta.seriesMemberships !== undefined) {
+        await this.seriesMemberships?.replaceForBook(bookId, meta.seriesMemberships);
+      } else {
+        await this.seriesMemberships?.syncPrimaryFromMetadata(bookId);
+      }
     }
 
     if (meta.externalProviderIds) await this.providerIdStore?.write(bookId, meta.externalProviderIds);
